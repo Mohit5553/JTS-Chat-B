@@ -16,12 +16,12 @@ function normalizeRole(role) {
 export function createSocketServer(httpServer) {
   const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:5173")
     .split(",")
-    .map(o => o.trim());
+    .map(o => o.trim().replace(/\/$/, ""));
 
   const io = new Server(httpServer, {
     cors: {
       origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ""))) return callback(null, true);
         callback(new Error(`Socket CORS blocked: ${origin}`));
       },
       methods: ["GET", "POST"],
