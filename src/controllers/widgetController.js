@@ -1,24 +1,24 @@
-import { Website } from "../models/Website.js";
+﻿import { Website } from "../models/Website.js";
 import { User } from "../models/User.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import AppError from "../utils/AppError.js";
 import { ChatSession } from "../models/ChatSession.js";
 import { Message } from "../models/Message.js";
 import { findOrCreateSession } from "../services/chatService.js";
+import { env } from "../config/env.js";
 
 export const getWidgetScript = asyncHandler(async (req, res) => {
-  const protocol = req.protocol;
-  const host = req.get("host");
-  const origin = `${protocol}://${host}`;
+  const widgetUrl = env.widgetPublicUrl;
+  const scriptOrigin = new URL(widgetUrl).origin;
 
   const script = `
 (function() {
   const currentScript = document.currentScript;
   const apiKey = currentScript && currentScript.getAttribute('data-api-key');
   if (!apiKey) return;
-  const origin = "${origin}";
+  const origin = "${scriptOrigin}";
   const s = document.createElement('script');
-  s.src = origin + "/chat-widget.js"; 
+  s.src = "${widgetUrl}";
   s.setAttribute('data-api-key', apiKey);
   document.head.appendChild(s);
 })();
