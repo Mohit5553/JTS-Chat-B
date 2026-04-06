@@ -2,7 +2,59 @@ import { ChatSession } from "../models/ChatSession.js";
 import { Message } from "../models/Message.js";
 import { Website } from "../models/Website.js";
 import { User } from "../models/User.js";
+import { Visitor } from "../models/Visitor.js";
 import { closeSession, findOrCreateSession, registerVisitor } from "../services/chatService.js";
+import { normalizeRole, getOwnedWebsiteIds } from "../utils/roleUtils.js";
+import { sendEmail } from "../services/emailService.js";
+import { chatTransferredTemplate } from "../utils/emailTemplates.js";
+import { env } from "../config/env.js";
+import { logAuditEvent } from "../services/auditService.js";
+import { createNotification } from "../services/notificationService.js";
+import { createActivityEvent, listActivityForEntity } from "../services/activityService.js";
+import { dispatchWebsiteWebhook } from "../services/webhookService.js";
+import { emitSessionUpdate } from "../sockets/index.js";
+import { PERMISSIONS, requirePermission } from "../utils/permissions.js";
+
+async function loadRealtimeSession(id) {
+  return ChatSession.findById(id)
+    .populate("assignedAgent", "name email role isOnline")
+    .populate("websiteId", "websiteName domain managerId")
+    .populate("visitorId", "visitorId name email deviceInfo ipAddress");
+}
+
+async function userHasWebsiteAccess(user, websiteId) {
+  const role = normalizeRole(user.role);
+  if (role === "admin") return true;
+  if (!websiteId) return false;
+  const websiteIds = await getOwnedWebsiteIds(user);
+  return websiteIds.some((id) => String(id) === String(websiteId));
+}
+
+function getSessionWebsiteId(session) {
+  return session?.websiteId?._id || session?.websiteId || null;
+}
+
+async function hasReachedActiveChatLimit(userId) {
+  const maxAllowed = 5;
+  const activeCount = await ChatSession.countDocuments({ assignedAgent: userId, status: "active" });
+  return activeCount >= maxAllowed;
+}
+
+async function ensureSessionStaffAccess(session, user) {
+  const role = normalizeRole(user.role);
+  if (role === "admin") return true;
+  const sessionWebsiteId = getSessionWebsiteId(session);
+  if (!sessionWebsiteId) {
+    return !!session.assignedAgent && String(session.assignedAgent) === String(user._id);
+  }
+  if (["client", "manager"].includes(role)) {
+    return userHasWebsiteAccess(user, sessionWebsiteId);
+  }
+  if (!await userHasWebsiteAccess(user, sessionWebsiteId)) {
+    return false;
+  }
+  return !session.assignedAgent || String(session.assignedAgent) === String(user._id);
+}
 
 async function populateMessageNames(messages) {
   const result = [];
@@ -20,17 +72,13 @@ async function populateMessageNames(messages) {
   return result;
 }
 
-function normalizeRole(role) {
-  return role === "manager" ? "admin" : role;
-}
-
 export async function uploadAttachment(req, res) {
   if (!req.file) return res.status(400).json({ message: "No file provided" });
-  
+
   const protocol = req.protocol;
   const host = req.get("host");
   const url = `${protocol}://${host}/uploads/${req.file.filename}`;
-  
+
   // Decide attachment type pseudo-logic
   const mimetype = req.file.mimetype;
   let attachmentType = "file";
@@ -40,36 +88,21 @@ export async function uploadAttachment(req, res) {
   return res.json({ url, attachmentType });
 }
 
-async function getOwnedWebsiteIds(user) {
-  const role = normalizeRole(user.role);
-  if (role === "admin") {
-    const websites = await Website.find({}).select("_id");
-    return websites.map((website) => website._id);
-  }
-
-  if (role === "client") {
-    const websites = await Website.find({ managerId: user._id }).select("_id");
-    return websites.map((website) => website._id);
-  }
-
-  return [];
-}
-
 function populateSession(query) {
   return query
     .populate("assignedAgent", "name email role isOnline")
     .populate("websiteId", "websiteName domain managerId")
-    .populate("visitorId", "visitorId deviceInfo ipAddress")
+    .populate("visitorId", "visitorId name email deviceInfo ipAddress browser os device country city timezone firstVisitTime lastVisitTime")
     .sort({ updatedAt: -1 });
 }
 
 export async function initVisitorSession(req, res) {
   const website = req.website;
-  const { visitorToken, deviceInfo, name, email } = req.body;
+  const { visitorToken, deviceInfo, name, email, currentPage, sessionId } = req.body;
   const ipAddress = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "";
 
   const { visitor } = await registerVisitor({ website, visitorToken, ipAddress, deviceInfo, name, email });
-  const session = await findOrCreateSession({ website, visitor });
+  const session = await findOrCreateSession({ website, visitor, currentPage, sessionId });
   const messages = await Message.find({ sessionId: session._id }).sort({ createdAt: 1 });
   const messagesWithNames = await populateMessageNames(messages);
 
@@ -83,12 +116,20 @@ export async function initVisitorSession(req, res) {
 }
 
 export async function listManagerSessions(req, res) {
+  requirePermission(req.user, PERMISSIONS.CHAT_VIEW);
   const websiteIds = await getOwnedWebsiteIds(req.user);
   const sessions = await populateSession(ChatSession.find({ websiteId: { $in: websiteIds } }));
   return res.json(sessions);
 }
 
 export async function listAgentSessions(req, res) {
+  requirePermission(req.user, PERMISSIONS.CHAT_VIEW);
+  const sessions = await populateSession(ChatSession.find({ assignedAgent: req.user._id }).limit(100));
+  return res.json(sessions);
+}
+
+export async function listSalesSessions(req, res) {
+  requirePermission(req.user, PERMISSIONS.CHAT_VIEW);
   const sessions = await populateSession(ChatSession.find({ assignedAgent: req.user._id }).limit(100));
   return res.json(sessions);
 }
@@ -107,11 +148,20 @@ export async function getSessionMessages(req, res) {
     return res.status(404).json({ message: "Session not found" });
   }
 
+  const sessionWebsiteId = getSessionWebsiteId(session);
   const role = normalizeRole(req.user.role);
-  if (role === "client" && session.websiteId.managerId.toString() !== req.user._id.toString()) {
+
+  if (!sessionWebsiteId) {
+    const canUseOrphanedSession = role === "admin"
+      || (!!session.assignedAgent && String(session.assignedAgent) === String(req.user._id));
+    if (!canUseOrphanedSession) {
+      return res.status(409).json({ message: "Session is missing website linkage" });
+    }
+  } else if (role !== "admin" && !await userHasWebsiteAccess(req.user, sessionWebsiteId)) {
     return res.status(403).json({ message: "Access denied" });
   }
-  if (role === "agent" && session.assignedAgent?.toString() !== req.user._id.toString()) {
+
+  if (role === "agent" && session.assignedAgent && session.assignedAgent.toString() !== req.user._id.toString()) {
     return res.status(403).json({ message: "Access denied" });
   }
 
@@ -121,21 +171,30 @@ export async function getSessionMessages(req, res) {
 }
 
 export async function acceptChatSession(req, res) {
+  requirePermission(req.user, PERMISSIONS.CHAT_VIEW);
   const session = await ChatSession.findOne({ sessionId: req.params.sessionId }).populate("websiteId", "managerId");
   if (!session) {
     return res.status(404).json({ message: "Session not found" });
   }
 
+  const sessionWebsiteId = getSessionWebsiteId(session);
+  if (!sessionWebsiteId) {
+    return res.status(409).json({ message: "Session is missing website linkage" });
+  }
+
   const role = normalizeRole(req.user.role);
   if (role === "agent") {
+    if (!session.assignedAgent && await hasReachedActiveChatLimit(req.user._id)) {
+      return res.status(409).json({ message: "You can only handle up to 5 active visitors at a time" });
+    }
     if (session.assignedAgent && session.assignedAgent.toString() !== req.user._id.toString()) {
       return res.status(409).json({ message: "This chat is already assigned to another user" });
     }
-    if (session.websiteId.managerId.toString() !== req.user.managerId?.toString()) {
+    if (!await userHasWebsiteAccess(req.user, sessionWebsiteId)) {
       return res.status(403).json({ message: "Access denied" });
     }
-  } else if (role === "client") {
-    if (session.websiteId.managerId.toString() !== req.user._id.toString()) {
+  } else if (role !== "admin") {
+    if (!await userHasWebsiteAccess(req.user, sessionWebsiteId)) {
       return res.status(403).json({ message: "Access denied" });
     }
   }
@@ -145,22 +204,61 @@ export async function acceptChatSession(req, res) {
   session.acceptedAt = session.acceptedAt || new Date();
   await session.save();
 
-  const populated = await ChatSession.findById(session._id)
-    .populate("assignedAgent", "name email role isOnline")
-    .populate("websiteId", "websiteName domain managerId")
-    .populate("visitorId", "visitorId deviceInfo ipAddress");
+  await createNotification({
+    recipient: session.websiteId.managerId,
+    type: "new_chat",
+    title: "Chat accepted",
+    message: `${req.user.name} accepted chat ${session.sessionId}.`,
+    link: `/client?tab=chats&sessionId=${session.sessionId}`,
+    actor: req.user,
+    entityType: "chat_session",
+    entityId: session._id,
+    metadata: { sessionId: session.sessionId }
+  });
+  await createActivityEvent({
+    actor: req.user,
+    websiteId: sessionWebsiteId,
+    entityType: "chat_session",
+    entityId: session._id,
+    type: "assigned",
+    summary: `Chat ${session.sessionId} was accepted`,
+    metadata: { assignedAgentId: req.user._id }
+  });
+  await logAuditEvent({
+    actor: req.user,
+    action: "chat.accepted",
+    entityType: "chat_session",
+    entityId: session._id,
+    websiteId: sessionWebsiteId,
+    metadata: { sessionId: session.sessionId },
+    ipAddress: req.ip
+  });
+  await dispatchWebsiteWebhook(sessionWebsiteId, "chat.assigned", {
+    sessionId: session.sessionId,
+    assignedAgentId: req.user._id,
+    assignedAgentName: req.user.name
+  });
+
+  const populated = await loadRealtimeSession(session._id);
+  emitSessionUpdate(populated);
 
   return res.json(populated);
 }
 
 export async function closeChatSession(req, res) {
+  requirePermission(req.user, PERMISSIONS.CHAT_VIEW);
   const session = await ChatSession.findOne({ sessionId: req.params.sessionId }).populate("websiteId", "managerId");
   if (!session) {
     return res.status(404).json({ message: "Session not found" });
   }
 
+  const sessionWebsiteId = getSessionWebsiteId(session);
+  if (!sessionWebsiteId) {
+    return res.status(409).json({ message: "Session is missing website linkage" });
+  }
+
   const role = normalizeRole(req.user.role);
-  if (role === "client" && session.websiteId.managerId.toString() !== req.user._id.toString()) {
+  if (role !== "admin" && !await userHasWebsiteAccess(req.user, sessionWebsiteId)) {
     return res.status(403).json({ message: "Access denied" });
   }
   if (role === "agent" && session.assignedAgent?.toString() !== req.user._id.toString()) {
@@ -168,6 +266,29 @@ export async function closeChatSession(req, res) {
   }
 
   const closed = await closeSession(session._id);
+  await createActivityEvent({
+    actor: req.user,
+    websiteId: sessionWebsiteId,
+    entityType: "chat_session",
+    entityId: session._id,
+    type: "status_changed",
+    summary: `Chat ${session.sessionId} was closed`,
+    metadata: { status: "closed" }
+  });
+  await logAuditEvent({
+    actor: req.user,
+    action: "chat.closed",
+    entityType: "chat_session",
+    entityId: session._id,
+    websiteId: sessionWebsiteId,
+    metadata: { sessionId: session.sessionId },
+    ipAddress: req.ip
+  });
+  await dispatchWebsiteWebhook(sessionWebsiteId, "chat.closed", {
+    sessionId: session.sessionId,
+    closedBy: req.user._id
+  });
+  emitSessionUpdate(await loadRealtimeSession(session._id));
   return res.json(closed);
 }
 
@@ -187,4 +308,306 @@ export async function submitSessionFeedback(req, res) {
   await session.save();
 
   return res.json({ success: true, satisfactionStatus: session.satisfactionStatus });
+}
+
+export async function getWidgetConfig(req, res) {
+  const website = req.website;
+
+  const agents = await User.find({
+    role: "agent",
+    managerId: website.managerId
+  }).sort({ lastActiveAt: -1 }).limit(1);
+
+  const lastActiveAt = agents.length > 0 ? agents[0].lastActiveAt : null;
+  const isAgentOnline = agents.length > 0 && agents[0].isOnline;
+
+  // Feature 7: Business hours check
+  const businessOpen = isBusinessOpen(website.businessHours);
+
+  return res.json({
+    websiteName: website.websiteName,
+    primaryColor: website.primaryColor,
+    accentColor: website.accentColor,
+    position: website.position || "right",
+    launcherIcon: website.launcherIcon,
+    welcomeMessage: website.welcomeMessage,
+    awayMessage: website.awayMessage,
+    isAgentOnline: !!isAgentOnline,
+    isBusinessOpen: businessOpen,
+    showOfflineForm: !businessOpen || !isAgentOnline,
+    lastActiveAt,
+    quickReplies: website.quickReplies || [],
+    businessHours: website.businessHours || null
+  });
+}
+
+
+export async function getChatHistory(req, res) {
+  try {
+    requirePermission(req.user, PERMISSIONS.CHAT_VIEW);
+    const { websiteId, agentId, startDate, endDate, searchTerm } = req.query;
+    const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+    const filter = { websiteId: { $in: ownedWebsiteIds } };
+
+    if (websiteId) {
+      if (ownedWebsiteIds.map(id => id.toString()).includes(websiteId)) {
+        filter.websiteId = websiteId;
+      }
+    }
+
+    if (agentId) filter.assignedAgent = agentId;
+
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.createdAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.createdAt.$lte = end;
+      }
+    }
+
+    if (searchTerm) {
+      const searchRegex = new RegExp(searchTerm, "i");
+      const matchingVisitors = await Visitor.find({
+        $or: [{ name: searchRegex }, { email: searchRegex }, { visitorId: searchRegex }]
+      }).select("_id");
+      const matchingMessages = await Message.find({ message: searchRegex }).select("sessionId").distinct("sessionId");
+      const visitorIds = matchingVisitors.map(v => v._id);
+      filter.$or = [
+        { lastMessagePreview: searchRegex },
+        { visitorId: { $in: visitorIds } },
+        { _id: { $in: matchingMessages } }
+      ];
+    }
+
+    const sessions = await ChatSession.find(filter)
+      .populate("assignedAgent", "name email")
+      .populate("websiteId", "websiteName domain")
+      .populate("visitorId", "visitorId name email")
+      .sort({ createdAt: -1 })
+      .limit(200);
+
+    return res.json(sessions);
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+}
+
+// ─── Feature 5: Chat Transfer ────────────────────────────────────────────────
+export async function transferChatSession(req, res) {
+  try {
+    requirePermission(req.user, PERMISSIONS.CHAT_TRANSFER);
+    const { toAgentId, note, reason = "manual_transfer" } = req.body;
+    const { sessionId } = req.params;
+
+    if (!toAgentId) return res.status(400).json({ message: "Target agent ID is required" });
+
+    const [session, toAgent] = await Promise.all([
+      ChatSession.findOne({ sessionId }).populate("visitorId", "name").populate("websiteId", "websiteName managerId"),
+      User.findById(toAgentId).select("name email role managerId")
+    ]);
+
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    const sessionWebsiteId = getSessionWebsiteId(session);
+    if (!sessionWebsiteId) return res.status(409).json({ message: "Session is missing website linkage" });
+    if (!await ensureSessionStaffAccess(session, req.user)) return res.status(403).json({ message: "Access denied" });
+    if (!toAgent || toAgent.role !== "agent") return res.status(400).json({ message: "Target must be an active agent" });
+    if (await hasReachedActiveChatLimit(toAgent._id)) {
+      return res.status(409).json({ message: "Target agent already has an active visitor" });
+    }
+    if (String(toAgent.managerId || "") !== String(session.websiteId.managerId || "")) {
+      return res.status(400).json({ message: "Target agent must belong to the same client account" });
+    }
+    if (!(toAgent.websiteIds || []).some((id) => String(id) === String(sessionWebsiteId))) {
+      return res.status(400).json({ message: "Target user must be assigned to this website" });
+    }
+
+    const fromAgent = req.user;
+    const fromAgentId = fromAgent._id;
+
+    // Record the transfer
+    session.transferredFrom = fromAgentId;
+    session.assignedAgent = toAgent._id;
+    session.acceptedAt = new Date();
+    if (!session.transferHistory) session.transferHistory = [];
+    session.transferHistory.unshift({
+      fromAgentId,
+      toAgentId: toAgent._id,
+      reason,
+      note: note || "",
+      transferredAt: new Date()
+    });
+    await session.save();
+
+    // Add a system message visible in chat
+    await Message.create({
+      sessionId: session._id,
+      sender: "system",
+      message: `Chat transferred from ${fromAgent.name} to ${toAgent.name}${note ? ` — Note: ${note}` : ""}.`
+    });
+
+    // 📧 Email the new agent
+    const dashboardUrl = `${env.clientUrl}/agent?tab=chats&sessionId=${sessionId}`;
+    const { html, subject } = chatTransferredTemplate({
+      agentName: toAgent.name,
+      fromAgentName: fromAgent.name,
+      visitorName: session.visitorId?.name,
+      sessionId,
+      dashboardUrl
+    });
+    await sendEmail({ to: toAgent.email, subject, html });
+    await createNotification({
+      recipient: toAgent._id,
+      type: "new_chat",
+      title: "Chat transferred to you",
+      message: `${fromAgent.name} transferred chat ${sessionId} to you.`,
+      link: `/client?tab=chats&sessionId=${sessionId}`,
+      actor: req.user,
+      entityType: "chat_session",
+      entityId: session._id,
+      metadata: { sessionId, reason }
+    });
+    await createActivityEvent({
+      actor: req.user,
+      websiteId: sessionWebsiteId,
+      entityType: "chat_session",
+      entityId: session._id,
+      type: "transferred",
+      summary: `Chat ${sessionId} was transferred to ${toAgent.name}`,
+      metadata: { fromAgentId, toAgentId: toAgent._id, reason, note: note || "" }
+    });
+    await logAuditEvent({
+      actor: req.user,
+      action: "chat.transferred",
+      entityType: "chat_session",
+      entityId: session._id,
+      websiteId: sessionWebsiteId,
+      metadata: { sessionId, toAgentId: toAgent._id, note: note || "", reason },
+      ipAddress: req.ip
+    });
+    await dispatchWebsiteWebhook(sessionWebsiteId, "chat.transferred", {
+      sessionId,
+      fromAgentId: fromAgent._id,
+      toAgentId: toAgent._id,
+      note: note || "",
+      reason
+    });
+
+    const populated = await loadRealtimeSession(session._id);
+    emitSessionUpdate(populated);
+
+    return res.json({ success: true, session: populated });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+}
+
+// ─── Feature 6: Internal Notes ───────────────────────────────────────────────
+export async function addInternalNote(req, res) {
+  try {
+    requirePermission(req.user, PERMISSIONS.CHAT_NOTE);
+    const { sessionId } = req.params;
+    const { content } = req.body;
+    if (!content?.trim()) return res.status(400).json({ message: "Note content is required" });
+
+    const session = await ChatSession.findOne({ sessionId }).populate("websiteId", "managerId");
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    if (!await ensureSessionStaffAccess(session, req.user)) return res.status(403).json({ message: "Access denied" });
+
+    const note = {
+      content: content.trim(),
+      agentId: req.user._id,
+      agentName: req.user.name,
+      createdAt: new Date()
+    };
+    session.internalNotes.push(note);
+    await session.save();
+    await createActivityEvent({
+      actor: req.user,
+      websiteId: session.websiteId,
+      entityType: "chat_session",
+      entityId: session._id,
+      type: "note_added",
+      summary: `An internal note was added to chat ${sessionId}`,
+      metadata: { note: note.content }
+    });
+    await logAuditEvent({
+      actor: req.user,
+      action: "chat.note_added",
+      entityType: "chat_session",
+      entityId: session._id,
+      websiteId: session.websiteId,
+      metadata: { sessionId, noteLength: note.content.length },
+      ipAddress: req.ip
+    });
+    emitSessionUpdate(await loadRealtimeSession(session._id));
+
+    return res.json({ success: true, note: session.internalNotes[session.internalNotes.length - 1] });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+}
+
+export async function getInternalNotes(req, res) {
+  try {
+    const { sessionId } = req.params;
+    const session = await ChatSession.findOne({ sessionId }).select("internalNotes websiteId").populate("websiteId", "managerId");
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    if (!await ensureSessionStaffAccess(session, req.user)) return res.status(403).json({ message: "Access denied" });
+    return res.json(session.internalNotes || []);
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+}
+
+export async function getSessionActivity(req, res) {
+  try {
+    requirePermission(req.user, PERMISSIONS.ACTIVITY_VIEW);
+    const { sessionId } = req.params;
+    const session = await ChatSession.findOne({ sessionId }).select("_id websiteId assignedAgent").populate("websiteId", "managerId");
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    if (!await ensureSessionStaffAccess(session, req.user)) return res.status(403).json({ message: "Access denied" });
+    const activity = await listActivityForEntity({ entityType: "chat_session", entityId: session._id, limit: 100 });
+    return res.json(activity);
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+}
+
+// ─── Feature 7: Business Hours helper ────────────────────────────────────────
+export function isBusinessOpen(businessHours) {
+  if (!businessHours?.enabled) return true; // if not configured → always open
+
+  const days = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const tz = businessHours.timezone || "Asia/Kolkata";
+
+  // Get current time in the configured timezone
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  });
+  const parts = formatter.formatToParts(now);
+  const dayName = parts.find(p => p.type === "weekday")?.value?.toLowerCase();
+  const hour = parseInt(parts.find(p => p.type === "hour")?.value || "0");
+  const minute = parseInt(parts.find(p => p.type === "minute")?.value || "0");
+  const currentMinutes = hour * 60 + minute;
+
+  const dayConfig = businessHours[dayName];
+  if (!dayConfig || !dayConfig.isOpen) return false;
+
+  const [openH, openM] = (dayConfig.open || "09:00").split(":").map(Number);
+  const [closeH, closeM] = (dayConfig.close || "17:00").split(":").map(Number);
+  const openMinutes = openH * 60 + openM;
+  const closeMinutes = closeH * 60 + closeM;
+
+  return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
 }

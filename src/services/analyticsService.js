@@ -35,6 +35,17 @@ export async function incrementVisitors(websiteId) {
   );
 }
 
+export async function incrementCustomers(websiteId) {
+  await ensureSnapshot(websiteId);
+  await AnalyticsSnapshot.updateOne({ websiteId, hour: truncateHour() }, { $inc: { totalCustomers: 1 } });
+  
+  return Analytics.findOneAndUpdate(
+    { websiteId },
+    { $inc: { totalCustomers: 1 } },
+    { upsert: true, new: true }
+  );
+}
+
 export async function incrementActiveChats(websiteId, delta = 1) {
   await ensureSnapshot(websiteId);
   await AnalyticsSnapshot.updateOne({ websiteId, hour: truncateHour() }, { $inc: { activeChats: delta } });

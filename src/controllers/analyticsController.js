@@ -1,14 +1,15 @@
 import { ChatSession } from "../models/ChatSession.js";
+import { Message } from "../models/Message.js";
 import { User } from "../models/User.js";
 import { Visitor } from "../models/Visitor.js";
 import { Website } from "../models/Website.js";
 import { AnalyticsSnapshot } from "../models/AnalyticsSnapshot.js";
+import { Ticket } from "../models/Ticket.js";
+import { normalizeRole, getOwnedWebsiteIds } from "../utils/roleUtils.js";
+
+
 
 const OWNER_ROLES = ["admin", "client", "manager"];
-
-function normalizeRole(role) {
-  return role === "manager" ? "admin" : role;
-}
 
 function startOfDay(date) {
   const next = new Date(date);
@@ -22,20 +23,23 @@ function endOfDay(date) {
   return next;
 }
 
-async function getOwnedWebsiteIds(user) {
-  const role = normalizeRole(user.role);
-  if (role === "admin") {
-    const websites = await Website.find({}).select("_id");
-    return websites.map((website) => website._id);
+function resolveDateRange(query) {
+  const now = new Date();
+  const rawStart = query.startDate ? new Date(query.startDate) : null;
+  const rawEnd = query.endDate ? new Date(query.endDate) : null;
+
+  const end = rawEnd && !Number.isNaN(rawEnd.getTime()) ? endOfDay(rawEnd) : endOfDay(now);
+  const fallbackStart = new Date(end);
+  fallbackStart.setDate(fallbackStart.getDate() - 6);
+  let start = rawStart && !Number.isNaN(rawStart.getTime()) ? startOfDay(rawStart) : startOfDay(fallbackStart);
+
+  if (start > end) {
+    start = startOfDay(end);
   }
 
-  if (role === "client") {
-    const websites = await Website.find({ managerId: user._id }).select("_id");
-    return websites.map((website) => website._id);
-  }
-
-  return [];
+  return { start, end };
 }
+
 
 export async function getManagerAnalytics(req, res) {
   const role = normalizeRole(req.user.role);
@@ -43,52 +47,74 @@ export async function getManagerAnalytics(req, res) {
     return res.status(403).json({ message: "Access denied" });
   }
 
-  const websiteFilter = role === "admin" ? {} : { managerId: req.user._id };
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const { websiteId } = req.query;
+  const { start, end } = resolveDateRange(req.query);
+
+  let websiteFilter = { _id: { $in: ownedWebsiteIds } };
+  if (websiteId) {
+    if (!ownedWebsiteIds.map(id => id.toString()).includes(websiteId)) {
+      return res.status(403).json({ message: "Access denied to this website" });
+    }
+    websiteFilter._id = websiteId;
+  }
+  
   const websites = await Website.find(websiteFilter).sort({ createdAt: -1 });
-  const websiteIds = websites.map((website) => website._id);
-  const agentFilter = role === "admin" ? { role: "agent" } : { role: "agent", managerId: req.user._id };
+  const websiteIds = websites.map((w) => w._id);
+
+  // If role is admin, show all agents. If client/manager, show personnel belonging to the parent client.
+  const managerIdForAgents = req.user.role === "client" ? req.user._id : req.user.managerId;
+  const agentFilter = req.user.role === "admin" 
+    ? { role: { $in: ["agent", "manager", "user", "sales"] } } 
+    : { role: { $in: ["agent", "manager", "user", "sales"] }, managerId: managerIdForAgents };
 
   const [
     agentCount, liveSessions, todaySessions, 
-    currentMonthVisitors, totalVisitors, 
+    rangeVisitors, totalVisitors, 
     satisfiedChats, unsatisfiedChats, 
     dailyChatVolume, monthlyVisitors, topCountries,
-    slaMetrics, leaderboard, analyticsSnapshots
+    slaMetrics, leaderboard, analyticsSnapshots,
+    resolvedTicketsCount
   ] = await Promise.all([
     User.countDocuments(agentFilter),
     ChatSession.countDocuments({ websiteId: { $in: websiteIds }, status: { $in: ["active", "queued"] } }),
     ChatSession.countDocuments({
       websiteId: { $in: websiteIds },
-      createdAt: { $gte: startOfDay(new Date()), $lte: endOfDay(new Date()) }
+      createdAt: { $gte: start, $lte: end }
     }),
     Visitor.countDocuments({
       websiteId: { $in: websiteIds },
-      firstVisitTime: { $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) }
+      firstVisitTime: { $gte: start, $lte: end }
     }),
     Visitor.countDocuments({ websiteId: { $in: websiteIds } }),
-    ChatSession.countDocuments({ websiteId: { $in: websiteIds }, satisfactionStatus: "satisfied" }),
-    ChatSession.countDocuments({ websiteId: { $in: websiteIds }, satisfactionStatus: "unsatisfied" }),
+    ChatSession.countDocuments({ websiteId: { $in: websiteIds }, satisfactionStatus: "satisfied", createdAt: { $gte: start, $lte: end } }),
+    ChatSession.countDocuments({ websiteId: { $in: websiteIds }, satisfactionStatus: "unsatisfied", createdAt: { $gte: start, $lte: end } }),
     ChatSession.aggregate([
-      { $match: { websiteId: { $in: websiteIds }, createdAt: { $gte: startOfDay(new Date(Date.now() - 6 * 24 * 60 * 60 * 1000)) } } },
+      { $match: { websiteId: { $in: websiteIds }, createdAt: { $gte: start, $lte: end } } },
       { $group: { _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" }, day: { $dayOfMonth: "$createdAt" } }, count: { $sum: 1 } } },
       { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } }
     ]),
     Visitor.aggregate([
-      { $match: { websiteId: { $in: websiteIds }, firstVisitTime: { $gte: new Date(new Date().getFullYear(), new Date().getMonth() - 5, 1) } } },
+      { $match: { websiteId: { $in: websiteIds }, firstVisitTime: { $gte: start, $lte: end } } },
       { $group: { _id: { year: { $year: "$firstVisitTime" }, month: { $month: "$firstVisitTime" } }, count: { $sum: 1 } } },
       { $sort: { "_id.year": 1, "_id.month": 1 } }
     ]),
     Visitor.aggregate([
-      { $match: { websiteId: { $in: websiteIds } } },
+      { $match: { websiteId: { $in: websiteIds }, firstVisitTime: { $gte: start, $lte: end } } },
       { $group: { _id: "$country", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
       { $limit: 5 }
     ]),
     ChatSession.aggregate([
-      { $match: { websiteId: { $in: websiteIds }, acceptedAt: { $ne: null } } },
+      { $match: { websiteId: { $in: websiteIds }, acceptedAt: { $ne: null }, createdAt: { $gte: start, $lte: end } } },
       { $group: {
           _id: null,
           avgWaitTimeMs: { $avg: { $subtract: ["$acceptedAt", "$createdAt"] } },
+          avgResponseTimeMs: { 
+            $avg: { 
+              $cond: [ { $ne: ["$firstResponseAt", null] }, { $subtract: ["$firstResponseAt", "$acceptedAt"] }, null ] 
+            } 
+          },
           avgHandleTimeMs: { 
             $avg: { 
               $cond: [ { $ne: ["$closedAt", null] }, { $subtract: ["$closedAt", "$acceptedAt"] }, null ] 
@@ -98,7 +124,7 @@ export async function getManagerAnalytics(req, res) {
       }
     ]),
     ChatSession.aggregate([
-      { $match: { websiteId: { $in: websiteIds }, assignedAgent: { $ne: null } } },
+      { $match: { websiteId: { $in: websiteIds }, assignedAgent: { $ne: null }, createdAt: { $gte: start, $lte: end } } },
       { $group: { 
           _id: "$assignedAgent", 
           chatsHandled: { $sum: 1 },
@@ -117,8 +143,9 @@ export async function getManagerAnalytics(req, res) {
     ]),
     AnalyticsSnapshot.find({ 
       websiteId: { $in: websiteIds }, 
-      hour: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } 
-    }).sort({ hour: 1 })
+      hour: { $gte: start, $lte: end } 
+    }).sort({ hour: 1 }),
+    Ticket.countDocuments({ websiteId: { $in: websiteIds }, status: "resolved", createdAt: { $gte: start, $lte: end } })
   ]);
 
   const totalFeedback = satisfiedChats + unsatisfiedChats;
@@ -129,8 +156,13 @@ export async function getManagerAnalytics(req, res) {
       agents: agentCount,
       liveSessions,
       dailyChats: todaySessions,
-      totalMonthlyVisitors: currentMonthVisitors,
-      totalVisitors
+      totalMonthlyVisitors: rangeVisitors,
+      totalVisitors,
+      resolvedTickets: resolvedTicketsCount
+    },
+    meta: {
+      startDate: start.toISOString(),
+      endDate: end.toISOString()
     },
     topCountries: topCountries.map(c => ({ country: c._id, count: c.count })),
     feedback: {
@@ -141,6 +173,7 @@ export async function getManagerAnalytics(req, res) {
     },
     sla: {
       avgWaitTimeSeconds: slaMetrics[0]?.avgWaitTimeMs ? Math.round(slaMetrics[0].avgWaitTimeMs / 1000) : 0,
+      avgResponseTimeSeconds: slaMetrics[0]?.avgResponseTimeMs ? Math.round(slaMetrics[0].avgResponseTimeMs / 1000) : 0,
       avgHandleTimeMinutes: slaMetrics[0]?.avgHandleTimeMs ? Number((slaMetrics[0].avgHandleTimeMs / (1000 * 60)).toFixed(1)) : 0
     },
     trends: {
@@ -159,12 +192,59 @@ export async function getManagerAnalytics(req, res) {
 }
 
 export async function exportAnalyticsCSV(req, res) {
-  const role = normalizeRole(req.user.role);
-  const websiteFilter = role === "admin" ? {} : { managerId: req.user._id };
+  const { websiteId, agentId, startDate, endDate } = req.query;
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+
+  let websiteFilter = { _id: { $in: ownedWebsiteIds } };
+  if (websiteId) {
+    if (!ownedWebsiteIds.map(id => id.toString()).includes(websiteId)) {
+      return res.status(403).json({ message: "Access denied to this website" });
+    }
+    websiteFilter._id = websiteId;
+  }
   const websites = await Website.find(websiteFilter);
   const websiteIds = websites.map((w) => w._id);
 
-  const sessions = await ChatSession.find({ websiteId: { $in: websiteIds } })
+  const sessionFilter = { websiteId: { $in: websiteIds } };
+  if (agentId) sessionFilter.assignedAgent = agentId;
+  if (startDate || endDate) {
+    sessionFilter.createdAt = {};
+    if (startDate) {
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      sessionFilter.createdAt.$gte = start;
+    }
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+      sessionFilter.createdAt.$lte = end;
+    }
+  }
+
+  if (req.query.searchTerm) {
+    const searchRegex = new RegExp(req.query.searchTerm, "i");
+    const matchingVisitors = await Visitor.find({
+      $or: [
+        { name: searchRegex },
+        { email: searchRegex },
+        { visitorId: searchRegex }
+      ]
+    }).select("_id");
+    
+    const matchingMessages = await Message.find({
+      message: searchRegex
+    }).select("sessionId").distinct("sessionId");
+    
+    const visitorIds = matchingVisitors.map(v => v._id);
+
+    sessionFilter.$or = [
+      { lastMessagePreview: searchRegex },
+      { visitorId: { $in: visitorIds } },
+      { _id: { $in: matchingMessages } }
+    ];
+  }
+
+  const sessions = await ChatSession.find(sessionFilter)
     .populate("websiteId", "websiteName")
     .populate("assignedAgent", "name email")
     .populate("visitorId", "name email")

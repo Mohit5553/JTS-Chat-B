@@ -5,6 +5,7 @@ const analyticsSnapshotSchema = new mongoose.Schema(
     websiteId: { type: mongoose.Schema.Types.ObjectId, ref: "Website", required: true, index: true },
     hour: { type: Date, required: true, index: true }, // Truncated to the hour
     totalVisitors: { type: Number, default: 0 },
+    totalCustomers: { type: Number, default: 0 },
     activeChats: { type: Number, default: 0 },
     resolvedChats: { type: Number, default: 0 },
     avgWaitTimeSeconds: { type: Number, default: 0 },

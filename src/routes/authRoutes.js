@@ -1,5 +1,13 @@
 import { Router } from "express";
-import { login, me, register } from "../controllers/authController.js";
+import {
+  disableTwoFactor,
+  login,
+  me,
+  register,
+  setupTwoFactor,
+  verifyTwoFactorSetup
+} from "../controllers/authController.js";
+import { forgotPassword, resetPassword } from "../controllers/passwordResetController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 
 const router = Router();
@@ -8,5 +16,13 @@ router.post("/register", register);
 router.post("/login", login);
 router.get("/me", requireAuth, me);
 router.post("/agents/register", requireAuth, requireRole("admin", "client"), register);
+router.post("/2fa/setup", requireAuth, setupTwoFactor);
+router.post("/2fa/verify", requireAuth, verifyTwoFactorSetup);
+router.post("/2fa/disable", requireAuth, disableTwoFactor);
+
+// Forgot / Reset Password
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password/:token", resetPassword);
 
 export default router;
+

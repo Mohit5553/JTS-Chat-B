@@ -24,7 +24,10 @@
     "mongoose": "^8.6.1",
     "morgan": "^1.10.0",
     "multer": "^2.1.1",
+    "nodemailer": "^8.0.4",
     "socket.io": "^4.8.1",
+    "stripe": "^22.0.0",
+    "ua-parser-js": "^2.0.9",
     "zod": "^4.3.6"
   },
   "devDependencies": {

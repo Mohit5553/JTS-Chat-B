@@ -2,7 +2,7 @@ import { Website } from "../models/Website.js";
 import { matchesWebsiteDomain } from "../utils/domain.js";
 
 export async function requireWebsiteApiKey(req, res, next) {
-  const apiKey = req.headers["x-api-key"] || req.query.apiKey || req.body.apiKey;
+  const apiKey = req.headers["x-api-key"] || req.query.apiKey;
 
   if (!apiKey) {
     return res.status(401).json({ message: "API key is required" });
