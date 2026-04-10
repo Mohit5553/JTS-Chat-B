@@ -23,6 +23,7 @@ import auditRoutes from "./routes/auditRoutes.js";
 import webhookRoutes from "./routes/webhookRoutes.js";
 import stripeWebhookRoutes from "./routes/stripeWebhookRoutes.js";
 import billingRoutes from "./routes/billingRoutes.js";
+import trackingRoutes from "./routes/trackingRoutes.js";
 import { env } from "./config/env.js";
 
 import errorMiddleware from "./middleware/errorMiddleware.js";
@@ -38,6 +39,7 @@ export function createApp() {
     "/api/widget/",
     "/api/tickets/submit",
     "/api/tickets/public/",
+    "/api/tracking/",
     "/uploads/"
   ];
 
@@ -123,6 +125,7 @@ export function createApp() {
   app.use("/api/audit-logs", auditRoutes);
   app.use("/api/webhooks", webhookRoutes);
   app.use("/api/billing", billingRoutes);
+  app.use("/api/tracking", trackingRoutes);
 
   app.all("*", (req, res, next) => {
     next(new AppError(`Can't find ${req.originalUrl} on this server!`, 404));

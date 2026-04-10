@@ -88,7 +88,8 @@ export const ACTIVITY_TYPES = Object.freeze([
   "transferred",
   "comment_added",
   "settings_updated",
-  "auto_assigned"
+  "auto_assigned",
+  "page_view"
 ]);
 
 export const FOLLOW_UP_TASK_TYPES = Object.freeze([

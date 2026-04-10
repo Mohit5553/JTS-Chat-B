@@ -55,6 +55,11 @@ const customerSchema = new mongoose.Schema(
     },
     tags: [{ type: String }],
     internalNotes: [{
+      type: {
+        type: String,
+        enum: ["note", "call", "meeting", "manual_email"],
+        default: "note"
+      },
       text: { type: String, required: true },
       authorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
       authorName: String,

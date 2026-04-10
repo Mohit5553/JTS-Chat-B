@@ -93,6 +93,8 @@ async function buildCustomerPayload(customerId) {
 
   if (!customer) return null;
 
+  const visitor = await Visitor.findOne({ customerId: customer._id }).select("visitorId");
+
   const [tasks, activity] = await Promise.all([
     FollowUpTask.find({ customerId: customer._id })
       .populate("ownerId", "name email role")
@@ -100,7 +102,12 @@ async function buildCustomerPayload(customerId) {
       .populate("completedBy", "name email role")
       .sort({ dueAt: 1, createdAt: -1 })
       .limit(50),
-    listActivityForEntity({ entityType: "customer", entityId: customer._id, limit: 50 })
+    listActivityForEntity({ 
+      entityType: "customer", 
+      entityId: customer._id, 
+      visitorId: visitor?.visitorId || null,
+      limit: 100 
+    })
   ]);
 
   return { customer, tasks, activity };
@@ -180,14 +187,45 @@ export const listCustomers = asyncHandler(async (req, res) => {
     query.archivedAt = { $ne: null };
   }
 
-  const [customers, total, myLeads, dueToday, noFollowUp, wonThisMonth, archived] = await Promise.all([
-    Customer.find(query)
-      .populate("ownerId", "name email role")
-      .populate("websiteId", "websiteName domain")
-      .sort({ lastInteraction: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit)),
-    Customer.countDocuments(query),
+  const customers = await Customer.find(query)
+    .populate("ownerId", "name email role")
+    .populate("websiteId", "websiteName")
+    .sort({ lastInteraction: -1 })
+    .skip((page - 1) * limit)
+    .limit(Number(limit));
+
+  const total = await Customer.countDocuments(query);
+
+  // Calculate dynamic heat scores for the current results
+  const nowTime = new Date();
+  const customersWithHeat = customers.map(c => {
+    const doc = c.toObject();
+    let score = 40; // baseline
+
+    // 1. Lead Value factor (0-20 pts)
+    score += Math.min(20, (doc.leadValue || 0) / 1000);
+
+    // 2. Recency factor (0-30 pts)
+    const daysSinceTouch = (nowTime - new Date(doc.lastInteraction)) / (1000 * 60 * 60 * 24);
+    if (daysSinceTouch < 2) score += 30;
+    else if (daysSinceTouch < 5) score += 15;
+    else if (daysSinceTouch < 10) score += 5;
+
+    // 3. Negative Decay (-3 per day, max -40)
+    score -= Math.min(40, daysSinceTouch * 3);
+
+    // 4. Priority boost
+    if (doc.priority === "high") score += 10;
+    
+    // 5. Activity depth (Internal notes count)
+    const notesCount = doc.internalNotes?.length || 0;
+    score += Math.min(15, notesCount * 3);
+
+    doc.heatScore = Math.max(0, Math.min(100, Math.round(score)));
+    return doc;
+  });
+
+  const [myLeads, dueToday, noFollowUp, wonThisMonth, archived] = await Promise.all([
     Customer.countDocuments({ websiteId: query.websiteId, ownerId: req.user._id, archivedAt: null }),
     FollowUpTask.countDocuments({
       websiteId: query.websiteId,
@@ -205,7 +243,7 @@ export const listCustomers = asyncHandler(async (req, res) => {
   ]);
 
   res.json({
-    customers,
+    customers: customersWithHeat,
     summary: { myLeads, dueToday, noFollowUp, wonThisMonth, archived },
     pagination: {
       total,
@@ -230,7 +268,8 @@ export const createCustomer = asyncHandler(async (req, res) => {
     pipelineStage,
     ownerId,
     tags,
-    notes
+    notes,
+    sessionId
   } = req.body;
   const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
 
@@ -354,10 +393,15 @@ export const createCustomer = asyncHandler(async (req, res) => {
       email: customer.email,
       pipelineStage: customer.pipelineStage,
       status: customer.status,
-      ownerId: resolvedOwnerId || null
+      ownerId: resolvedOwnerId || null,
+      sessionId: sessionId || null
     },
     ipAddress: req.ip
   });
+
+  if (sessionId) {
+    await ChatSession.updateOne({ _id: sessionId }, { customerId: customer._id, crn: customer.crn });
+  }
 
   const created = await Customer.findById(customer._id)
     .populate("ownerId", "name email role")
@@ -652,8 +696,12 @@ export const updateCustomer = asyncHandler(async (req, res) => {
  */
 export const addCustomerNote = asyncHandler(async (req, res) => {
   requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
-  const { text } = req.body;
-  if (!text) throw new AppError("Note text is required", 400);
+  
+  // Support both legacy "text" and unified "content"/"type" payload formats
+  const { text, content, type = "note" } = req.body;
+  const noteText = content || text;
+  
+  if (!noteText) throw new AppError("Note text or interaction content is required", 400);
 
   const customer = await Customer.findById(req.params.id);
   if (!customer) throw new AppError("Customer not found", 404);
@@ -664,30 +712,46 @@ export const addCustomerNote = asyncHandler(async (req, res) => {
   }
 
   customer.internalNotes.unshift({
-    text,
+    type,
+    text: noteText,
     authorId: req.user._id,
     authorName: req.user.name,
     createdAt: new Date()
   });
 
+  customer.lastInteraction = new Date();
   await customer.save();
+
+  // Map interaction types to distinct activity events for better timeline visualization
+  const activityTypeMap = {
+    call: "call_logged",
+    meeting: "meeting_logged",
+    manual_email: "manual_email_logged",
+    note: "note_added"
+  };
+
+  const activityType = activityTypeMap[type] || "note_added";
+  const summaryTypeLabel = type === "note" ? "CRM note" : `${type.replace("_", " ")} interaction`;
+
   await emitCustomerActivity({
     actor: req.user,
     websiteId: customer.websiteId,
     customerId: customer._id,
-    type: "note_added",
-    summary: `A CRM note was added for ${customer.name}`,
-    metadata: { note: text }
+    type: activityType,
+    summary: `A ${summaryTypeLabel} was logged for ${customer.name}`,
+    metadata: { note: noteText, interactionType: type }
   });
+
   await logAuditEvent({
     actor: req.user,
-    action: "crm.note_added",
+    action: `crm.${type}_added`,
     entityType: "customer",
     entityId: customer._id,
     websiteId: customer.websiteId,
-    metadata: { noteLength: text.length },
+    metadata: { noteLength: noteText.length, type },
     ipAddress: req.ip
   });
+
   res.json(customer);
 });
 
@@ -1129,4 +1193,40 @@ export const autoAssignCustomer = asyncHandler(async (req, res) => {
 
   const updated = await buildCustomerPayload(customer._id);
   res.json(updated.customer);
+});
+
+/**
+ * List all follow-up tasks assigned to the current user across all customers.
+ */
+export const getMyFollowUpTasks = asyncHandler(async (req, res) => {
+  const query = { ownerId: req.user._id };
+  if (req.query.status) query.status = req.query.status;
+
+  const tasks = await FollowUpTask.find(query)
+    .populate("customerId", "name email crn status priority leadValue")
+    .sort({ dueAt: 1 });
+
+  res.json(tasks);
+});
+
+/**
+ * List all internal notes from leads owned by the current user.
+ */
+export const getMyCustomerNotes = asyncHandler(async (req, res) => {
+  const customers = await Customer.find({ 
+    ownerId: req.user._id, 
+    "internalNotes.0": { $exists: true } 
+  }).select("name email internalNotes crn");
+
+  const allNotes = customers.flatMap(c => 
+    c.internalNotes.map(n => ({
+      ...n.toObject(),
+      customerName: c.name,
+      customerEmail: c.email,
+      customerId: c._id,
+      customerCrn: c.crn
+    }))
+  ).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  res.json(allNotes);
 });

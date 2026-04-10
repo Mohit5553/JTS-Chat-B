@@ -4,7 +4,7 @@ import { requireAuth, requireRole } from "../middleware/auth.js";
 
 const router = Router();
 
-router.use(requireAuth, requireRole("admin", "client", "manager"));
+router.use(requireAuth, requireRole("admin", "client", "manager", "sales"));
 router.get("/", listWebsites);
 router.post("/", createWebsite);
 router.patch("/:id", updateWebsite);

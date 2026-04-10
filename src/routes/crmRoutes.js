@@ -13,7 +13,9 @@ import {
   updateFollowUpTask,
   deleteFollowUpTask,
   mergeCustomers,
-  autoAssignCustomer
+  autoAssignCustomer,
+  getMyFollowUpTasks,
+  getMyCustomerNotes
 } from "../controllers/crmController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
@@ -39,6 +41,8 @@ router.use(requirePlanFeature("crm"));
 
 // List & create
 router.get("/", listCustomers);
+router.get("/tasks/my", getMyFollowUpTasks);
+router.get("/notes/my", getMyCustomerNotes);
 router.post("/", requireRole("admin", "client", "manager", "sales"), validate(createCustomerSchema), createCustomer);
 
 // Single record operations

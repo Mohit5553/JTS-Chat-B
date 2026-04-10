@@ -31,8 +31,18 @@ export async function createActivityEvent({
   }
 }
 
-export async function listActivityForEntity({ entityType, entityId, limit = 50 }) {
-  return ActivityEvent.find({ entityType, entityId: String(entityId) })
+export async function listActivityForEntity({ entityType, entityId, visitorId = null, limit = 100 }) {
+  const query = {
+    $or: [
+      { entityType, entityId: String(entityId) }
+    ]
+  };
+
+  if (visitorId) {
+    query.$or.push({ "metadata.visitorId": String(visitorId) });
+  }
+
+  return ActivityEvent.find(query)
     .sort({ createdAt: -1 })
     .limit(limit);
 }
