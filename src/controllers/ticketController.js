@@ -552,8 +552,9 @@ export const updateTicket = async (req, res) => {
     const { id } = req.params;
     const { status, priority, stage, crmStage, category, subcategory, note, noteIsPublic, assignedAgent, assignmentReason, escalationLevel, watchers, archiveReason } = req.body;
 
-    const ticket = await findScopedTicketById(id, req.user).populate("visitorId", "name email");
+    const ticket = await findScopedTicketById(id, req.user);
     if (!ticket) return res.status(404).json({ message: "Ticket not found" });
+    await ticket.populate("visitorId", "name email");
 
     const prevStatus = ticket.status;
     const prevAssignedAgent = ticket.assignedAgent;

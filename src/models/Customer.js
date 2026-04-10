@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { CRM_STATUSES, CRM_PIPELINE_STAGES } from "../constants/domain.js";
 
 const customerAssignmentHistorySchema = new mongoose.Schema({
   ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
@@ -37,19 +38,25 @@ const customerSchema = new mongoose.Schema(
     websiteId: { type: mongoose.Schema.Types.ObjectId, ref: "Website", required: true },
     ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     ownerAssignedAt: { type: Date, default: null },
-    status: { 
-      type: String, 
-      enum: ["prospect", "lead", "customer", "inactive"], 
-      default: "prospect" 
+    priority: {
+      type: String,
+      enum: ["low", "medium", "high"],
+      default: "medium"
+    },
+    status: {
+      type: String,
+      enum: [...CRM_STATUSES],
+      default: "new"
     },
     pipelineStage: {
       type: String,
-      enum: ["new", "qualified", "hold", "proposition", "won", "lost"],
+      enum: [...CRM_PIPELINE_STAGES],
       default: "new"
     },
     tags: [{ type: String }],
     internalNotes: [{
       text: { type: String, required: true },
+      authorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
       authorName: String,
       createdAt: { type: Date, default: Date.now }
     }],
@@ -73,5 +80,10 @@ const customerSchema = new mongoose.Schema(
 customerSchema.index({ email: 1, websiteId: 1 });
 customerSchema.index({ phone: 1, websiteId: 1 });
 customerSchema.index({ companyName: 1, websiteId: 1 });
+
+// Performance indexes for common CRM query patterns
+customerSchema.index({ ownerId: 1, archivedAt: 1, pipelineStage: 1 }); // "my leads" + auto-assign
+customerSchema.index({ pipelineStage: 1, updatedAt: 1, websiteId: 1 }); // "won this month" view
+customerSchema.index({ nextFollowUpAt: 1, websiteId: 1 });              // "no follow-up" view
 
 export const Customer = mongoose.model("Customer", customerSchema);

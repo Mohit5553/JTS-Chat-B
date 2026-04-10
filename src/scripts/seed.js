@@ -5,35 +5,48 @@ import { User } from "../models/User.js";
 async function seed() {
   await connectDatabase();
 
-  let admin = await User.findOne({ email: "admin@example.com" });
+  let admin = await User.findOne({ email: "jtsadmin@gmail.com" });
   if (!admin) {
     admin = await User.create({
-      name: "Default Admin",
-      email: "admin@example.com",
-      password: await bcrypt.hash("Password123!", 10),
+      name: "Admin",
+      email: "jtsadmin@gmail.com",
+      password: await bcrypt.hash("jts@123", 10),
       role: "admin"
     });
+  } else {
+    admin.password = await bcrypt.hash("jts@123", 10);
+    admin.role = "admin";
+    await admin.save();
   }
 
-  let client = await User.findOne({ email: "client@example.com" });
+  let client = await User.findOne({ email: "client@gmail.com" });
   if (!client) {
     client = await User.create({
-      name: "Default Client",
-      email: "client@example.com",
-      password: await bcrypt.hash("Password123!", 10),
+      name: "Client",
+      email: "client@gmail.com",
+      password: await bcrypt.hash("123456", 10),
       role: "client"
     });
+  } else {
+    client.password = await bcrypt.hash("123456", 10);
+    client.role = "client";
+    await client.save();
   }
 
-  let agent = await User.findOne({ email: "agent@example.com" });
+  let agent = await User.findOne({ email: "agent@gmail.com" });
   if (!agent) {
     agent = await User.create({
-      name: "Default Agent",
-      email: "agent@example.com",
-      password: await bcrypt.hash("Password123!", 10),
+      name: "Agent",
+      email: "agent@gmail.com",
+      password: await bcrypt.hash("123456", 10),
       role: "agent",
       managerId: client._id
     });
+  } else {
+    agent.password = await bcrypt.hash("123456", 10);
+    agent.role = "agent";
+    agent.managerId = client._id;
+    await agent.save();
   }
 
   console.log("Seed complete");

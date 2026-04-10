@@ -15,6 +15,7 @@ import { logAuditEvent } from "../services/auditService.js";
 import { createActivityEvent, listActivityForEntity } from "../services/activityService.js";
 import { getSocketServer } from "../sockets/index.js";
 import { PERMISSIONS, requirePermission } from "../utils/permissions.js";
+import { SALES_ALLOWED_STATUS_TRANSITIONS } from "../constants/domain.js";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -97,7 +98,8 @@ async function buildCustomerPayload(customerId) {
       .populate("ownerId", "name email role")
       .populate("createdBy", "name email role")
       .populate("completedBy", "name email role")
-      .sort({ dueAt: 1, createdAt: -1 }),
+      .sort({ dueAt: 1, createdAt: -1 })
+      .limit(50),
     listActivityForEntity({ entityType: "customer", entityId: customer._id, limit: 50 })
   ]);
 
@@ -131,7 +133,7 @@ export const listCustomers = asyncHandler(async (req, res) => {
   }
 
   const query = {};
-  
+
   // If specific website requested, verify ownership
   if (websiteId) {
     if (!ownedWebsiteIds.map(id => id.toString()).includes(websiteId)) {
@@ -158,6 +160,11 @@ export const listCustomers = asyncHandler(async (req, res) => {
     ];
   }
 
+  // Sales role can ONLY see their own assigned leads
+  if (req.user.role === "sales") {
+    query.ownerId = req.user._id;
+  }
+
   const now = new Date();
   if (view === "my_leads") {
     query.ownerId = req.user._id;
@@ -173,33 +180,33 @@ export const listCustomers = asyncHandler(async (req, res) => {
     query.archivedAt = { $ne: null };
   }
 
-  const customers = await Customer.find(query)
-    .populate("ownerId", "name email role")
-    .populate("websiteId", "websiteName domain")
-    .sort({ lastInteraction: -1 })
-    .skip((page - 1) * limit)
-    .limit(parseInt(limit));
-
-  const total = await Customer.countDocuments(query);
+  const [customers, total, myLeads, dueToday, noFollowUp, wonThisMonth, archived] = await Promise.all([
+    Customer.find(query)
+      .populate("ownerId", "name email role")
+      .populate("websiteId", "websiteName domain")
+      .sort({ lastInteraction: -1 })
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit)),
+    Customer.countDocuments(query),
+    Customer.countDocuments({ websiteId: query.websiteId, ownerId: req.user._id, archivedAt: null }),
+    FollowUpTask.countDocuments({
+      websiteId: query.websiteId,
+      ownerId: req.user._id,
+      status: { $in: ["open", "in_progress"] },
+      dueAt: { $lte: new Date(new Date().setHours(23, 59, 59, 999)) }
+    }),
+    Customer.countDocuments({ websiteId: query.websiteId, archivedAt: null, nextFollowUpAt: null }),
+    Customer.countDocuments({
+      websiteId: query.websiteId,
+      pipelineStage: "won",
+      updatedAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
+    }),
+    Customer.countDocuments({ websiteId: query.websiteId, archivedAt: { $ne: null } })
+  ]);
 
   res.json({
     customers,
-    summary: {
-      myLeads: await Customer.countDocuments({ websiteId: query.websiteId, ownerId: req.user._id, archivedAt: null }),
-      dueToday: await FollowUpTask.countDocuments({
-        websiteId: query.websiteId,
-        ownerId: req.user._id,
-        status: { $in: ["open", "in_progress"] },
-        dueAt: { $lte: new Date(new Date().setHours(23, 59, 59, 999)) }
-      }),
-      noFollowUp: await Customer.countDocuments({ websiteId: query.websiteId, archivedAt: null, nextFollowUpAt: null }),
-      wonThisMonth: await Customer.countDocuments({
-        websiteId: query.websiteId,
-        pipelineStage: "won",
-        updatedAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
-      }),
-      archived: await Customer.countDocuments({ websiteId: query.websiteId, archivedAt: { $ne: null } })
-    },
+    summary: { myLeads, dueToday, noFollowUp, wonThisMonth, archived },
     pagination: {
       total,
       page: parseInt(page),
@@ -222,10 +229,17 @@ export const createCustomer = asyncHandler(async (req, res) => {
     status,
     pipelineStage,
     ownerId,
-    tags
+    tags,
+    notes
   } = req.body;
   const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
-  if (!ownedWebsiteIds.map(id => id.toString()).includes(String(websiteId))) {
+
+  // If no websiteId provided but we have exactly one website, use that
+  let resolvedWebsiteId = websiteId;
+  if (!resolvedWebsiteId && ownedWebsiteIds.length === 1) {
+    resolvedWebsiteId = ownedWebsiteIds[0];
+  }
+  if (!resolvedWebsiteId || !ownedWebsiteIds.map(id => id.toString()).includes(String(resolvedWebsiteId))) {
     throw new AppError("Unauthorized access to this website's CRM data", 403);
   }
 
@@ -260,6 +274,11 @@ export const createCustomer = asyncHandler(async (req, res) => {
     resolvedOwnerId = nextOwner._id;
   }
 
+  // For sales role: auto-assign lead to themselves
+  if (req.user.role === "sales" && !resolvedOwnerId) {
+    resolvedOwnerId = req.user._id;
+  }
+
   const customer = await Customer.create({
     crn: await generateCRN(),
     name,
@@ -269,12 +288,17 @@ export const createCustomer = asyncHandler(async (req, res) => {
     leadSource: leadSource || "",
     leadValue: Number(leadValue || 0),
     expectedCloseDate: expectedCloseDate ? new Date(expectedCloseDate) : null,
-    websiteId,
-    status: status || "lead",
+    websiteId: resolvedWebsiteId,
+    status: status || "new",
     pipelineStage: pipelineStage || "new",
     ownerId: resolvedOwnerId,
     ownerAssignedAt: resolvedOwnerId ? new Date() : null,
     tags: Array.isArray(tags) ? tags : [],
+    internalNotes: notes && String(notes).trim() ? [{
+      text: String(notes).trim(),
+      authorName: req.user.name,
+      createdAt: new Date()
+    }] : [],
     assignmentHistory: resolvedOwnerId ? [{
       ownerId: resolvedOwnerId,
       assignedBy: req.user._id,
@@ -389,7 +413,7 @@ export const getCustomerProfile = asyncHandler(async (req, res) => {
   requirePermission(req.user, PERMISSIONS.CRM_VIEW);
   const payload = await buildCustomerPayload(req.params.id);
   const customer = payload?.customer;
-    
+
   if (!customer) throw new AppError("Customer not found", 404);
 
   // Security check: must own the website
@@ -400,7 +424,7 @@ export const getCustomerProfile = asyncHandler(async (req, res) => {
 
   // Build OR queries so we match records linked by customerId (new) OR by crn (pre-backfill)
   const sessionFilter = { websiteId: customer.websiteId._id, $or: [{ customerId: customer._id }] };
-  const ticketFilter  = { websiteId: customer.websiteId._id, $or: [{ customerId: customer._id }] };
+  const ticketFilter = { websiteId: customer.websiteId._id, $or: [{ customerId: customer._id }] };
   if (customer.crn) {
     sessionFilter.$or.push({ crn: customer.crn });
     ticketFilter.$or.push({ crn: customer.crn });
@@ -492,6 +516,28 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
   if (!ownedWebsiteIds.map(id => id.toString()).includes(customer.websiteId.toString())) {
     throw new AppError("Unauthorized access", 403);
+  }
+
+  // Sales: enforce status transition limits
+  if (req.user.role === "sales") {
+    if (status && status !== customer.status) {
+      const currentStatus = customer.status || "new";
+      const allowed = SALES_ALLOWED_STATUS_TRANSITIONS[currentStatus] || [currentStatus];
+      if (!allowed.includes(status)) {
+        throw new AppError(
+          `Sales cannot change status from "${currentStatus}" to "${status}". Allowed transitions: ${allowed.join(", ")}`,
+          403
+        );
+      }
+    }
+    // Sales cannot reassign leads
+    if (ownerId !== undefined && String(ownerId) !== String(req.user._id)) {
+      throw new AppError("Sales users cannot reassign leads to other users", 403);
+    }
+    // Sales cannot edit core identity fields
+    if (req.body.email !== undefined) {
+      throw new AppError("Sales users cannot change a lead's email address", 403);
+    }
   }
 
   if (status) customer.status = status;
@@ -619,6 +665,7 @@ export const addCustomerNote = asyncHandler(async (req, res) => {
 
   customer.internalNotes.unshift({
     text,
+    authorId: req.user._id,
     authorName: req.user.name,
     createdAt: new Date()
   });
@@ -661,16 +708,15 @@ export const sendCustomerEmail = asyncHandler(async (req, res) => {
     throw new AppError("Unauthorized access", 403);
   }
 
-  if (req.user.role !== "sales") {
-    throw new AppError("Only sales users can send customer emails", 403);
+  // Manager can send emails freely; sales can only email their own leads
+  if (req.user.role === "sales") {
+    if (customer.ownerId && String(customer.ownerId) !== String(req.user._id)) {
+      throw new AppError("You can only email customers assigned to you", 403);
+    }
   }
 
   if (!customer.email || customer.email.endsWith("@visitor.local")) {
     throw new AppError("Customer does not have a valid email address yet", 400);
-  }
-
-  if (customer.ownerId && String(customer.ownerId) !== String(req.user._id)) {
-    throw new AppError("Only the assigned sales owner can email this customer", 403);
   }
 
   let scopedTicketId = null;
@@ -767,7 +813,7 @@ export const sendCustomerEmail = asyncHandler(async (req, res) => {
 });
 
 export const deleteCustomer = asyncHandler(async (req, res) => {
-  requirePermission(req.user, PERMISSIONS.CRM_DELETE, "Only client or admin can permanently delete CRM records");
+  requirePermission(req.user, PERMISSIONS.CRM_DELETE, "Only manager, client, or admin can permanently delete CRM records");
 
   const customer = await Customer.findById(req.params.id);
   if (!customer) throw new AppError("Customer not found", 404);
@@ -835,12 +881,14 @@ export const createFollowUpTask = asyncHandler(async (req, res) => {
   });
 
   if (task.ownerId) {
+    const taskOwnerIdStr = String(task.ownerId);
+    const notificationLink = req.user.role === "sales" ? "/sales" : "/client?tab=crm";
     await createAndEmitCrmNotification({
       recipient: task.ownerId,
       type: "crm_follow_up_due",
       title: "CRM follow-up task assigned",
       message: `${customer.name}: ${task.title}`,
-      link: "/client?tab=crm"
+      link: notificationLink
     });
   }
 
@@ -973,4 +1021,112 @@ export const mergeCustomers = asyncHandler(async (req, res) => {
   });
 
   res.json(await buildCustomerPayload(primary._id));
+});
+
+/**
+ * Auto-assign a lead to the sales agent with fewest active leads (round-robin).
+ */
+export const autoAssignCustomer = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_AUTO_ASSIGN, "Only managers can auto-assign leads");
+
+  const customer = await Customer.findById(req.params.id);
+  if (!customer) throw new AppError("Customer not found", 404);
+
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  if (!ownedWebsiteIds.map((id) => String(id)).includes(String(customer.websiteId))) {
+    throw new AppError("Unauthorized access", 403);
+  }
+
+  // Find all active sales agents in this tenant
+  const requiredManagerId = req.user.role === "admin"
+    ? null
+    : (req.user.role === "client" ? req.user._id : req.user.managerId);
+
+  const salesAgentQuery = {
+    role: "sales"
+  };
+  if (requiredManagerId) {
+    salesAgentQuery.managerId = requiredManagerId;
+  }
+
+  const salesAgents = await User.find(salesAgentQuery).select("_id name email websiteIds");
+
+  // Filter to agents who are scoped to this website
+  const eligibleAgents = salesAgents.filter(agent => {
+    const assigned = Array.isArray(agent.websiteIds) ? agent.websiteIds : [];
+    if (assigned.length === 0) return true; // tenant-wide agent
+    return assigned.some(id => String(id) === String(customer.websiteId));
+  });
+
+  if (eligibleAgents.length === 0) {
+    throw new AppError("No eligible sales agents found for this website", 404);
+  }
+
+  // Count active leads per agent using a single $group aggregation
+  const eligibleAgentIds = eligibleAgents.map(a => a._id);
+  const leadCountAgg = await Customer.aggregate([
+    {
+      $match: {
+        ownerId: { $in: eligibleAgentIds },
+        archivedAt: null,
+        pipelineStage: { $nin: ["won", "lost"] }
+      }
+    },
+    { $group: { _id: "$ownerId", count: { $sum: 1 } } }
+  ]);
+
+  // Build a map: agentId → leadCount (default 0)
+  const countMap = new Map(leadCountAgg.map(r => [String(r._id), r.count]));
+  const leadCounts = eligibleAgents.map(agent => ({
+    agent,
+    count: countMap.get(String(agent._id)) || 0
+  }));
+
+  // Sort by fewest leads → pick first (round-robin)
+  leadCounts.sort((a, b) => a.count - b.count);
+  const { agent: nextOwner } = leadCounts[0];
+
+  const previousOwnerId = customer.ownerId ? String(customer.ownerId) : null;
+  customer.ownerId = nextOwner._id;
+  customer.ownerAssignedAt = new Date();
+  if (!customer.assignmentHistory) customer.assignmentHistory = [];
+  customer.assignmentHistory.unshift({
+    ownerId: nextOwner._id,
+    assignedBy: req.user._id,
+    reason: "auto_assign_round_robin",
+    assignedAt: new Date()
+  });
+  await customer.save();
+
+  if (String(previousOwnerId || "") !== String(nextOwner._id)) {
+    await createAndEmitCrmNotification({
+      recipient: nextOwner._id,
+      type: "crm_lead_assigned",
+      title: "Lead auto-assigned to you",
+      message: `${customer.name} was automatically assigned to you.`,
+      link: "/sales"
+    });
+  }
+
+  await emitCustomerActivity({
+    actor: req.user,
+    websiteId: customer.websiteId,
+    customerId: customer._id,
+    type: "auto_assigned",
+    summary: `Lead auto-assigned to ${nextOwner.name} (round-robin)`,
+    metadata: { assignedTo: nextOwner._id, assignedToName: nextOwner.name, reason: "round_robin" }
+  });
+
+  await logAuditEvent({
+    actor: req.user,
+    action: "crm.lead_auto_assigned",
+    entityType: "customer",
+    entityId: customer._id,
+    websiteId: customer.websiteId,
+    metadata: { assignedTo: nextOwner._id, assignedToName: nextOwner.name },
+    ipAddress: req.ip
+  });
+
+  const updated = await buildCustomerPayload(customer._id);
+  res.json(updated.customer);
 });

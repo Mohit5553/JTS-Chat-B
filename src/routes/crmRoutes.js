@@ -12,10 +12,12 @@ import {
   createFollowUpTask,
   updateFollowUpTask,
   deleteFollowUpTask,
-  mergeCustomers
+  mergeCustomers,
+  autoAssignCustomer
 } from "../controllers/crmController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
+import { attachOwnedWebsiteIds } from "../middleware/attachOwnedWebsiteIds.js";
 import {
   validate,
   updateCustomerSchema,
@@ -29,23 +31,42 @@ import { upload } from "../utils/multerConfig.js";
 
 const router = Router();
 
-// All CRM routes are protected and require agent/manager access
-router.use(requireAuth, requireRole("admin", "client", "agent", "sales"));
+// All CRM routes require auth + at minimum sales/manager/agent access
+router.use(requireAuth, requireRole("admin", "client", "manager", "agent", "sales"));
+router.use(attachOwnedWebsiteIds);   // resolves req.ownedWebsiteIds once per request
 router.use(attachTenantSubscription);
 router.use(requirePlanFeature("crm"));
 
+// List & create
 router.get("/", listCustomers);
-router.post("/", requireRole("admin", "client", "sales"), validate(createCustomerSchema), createCustomer);
-router.post("/:id/archive", requireRole("admin", "client", "sales"), archiveCustomer);
-router.post("/merge", requireRole("admin", "client", "manager"), validate(mergeCustomersSchema), mergeCustomers);
+router.post("/", requireRole("admin", "client", "manager", "sales"), validate(createCustomerSchema), createCustomer);
+
+// Single record operations
 router.get("/:id", getCustomerProfile);
 router.get("/:id/activity", getCustomerActivity);
-router.patch("/:id", requireRole("admin", "client", "sales"), validate(updateCustomerSchema), updateCustomer);
-router.post("/:id/notes", requireRole("admin", "client", "sales"), addCustomerNote);
-router.post("/:id/send-email", requireRole("sales"), upload.single("attachment"), sendCustomerEmail);
-router.post("/:id/tasks", requireRole("admin", "client", "sales"), validate(createFollowUpTaskSchema), createFollowUpTask);
-router.patch("/:id/tasks/:taskId", requireRole("admin", "client", "sales"), validate(updateFollowUpTaskSchema), updateFollowUpTask);
-router.delete("/:id/tasks/:taskId", requireRole("admin", "client", "sales"), deleteFollowUpTask);
-router.delete("/:id", requireRole("admin", "client"), deleteCustomer);
+router.patch("/:id", requireRole("admin", "client", "manager", "sales"), validate(updateCustomerSchema), updateCustomer);
+
+// Notes (sales can add notes to their own leads)
+router.post("/:id/notes", requireRole("admin", "client", "manager", "sales"), addCustomerNote);
+
+// Archive (manager + owner roles only; sales cannot archive)
+router.post("/:id/archive", requireRole("admin", "client", "manager"), archiveCustomer);
+
+// Delete (manager + owner; sales cannot delete)
+router.delete("/:id", requireRole("admin", "client", "manager"), deleteCustomer);
+
+// Auto-assign (manager + owner only)
+router.post("/:id/auto-assign", requireRole("admin", "client", "manager"), autoAssignCustomer);
+
+// Email (sales + manager)
+router.post("/:id/send-email", requireRole("admin", "client", "manager", "sales"), upload.single("attachment"), sendCustomerEmail);
+
+// Merge (manager + owner)
+router.post("/merge", requireRole("admin", "client", "manager"), validate(mergeCustomersSchema), mergeCustomers);
+
+// Follow-up tasks (all CRM roles)
+router.post("/:id/tasks", requireRole("admin", "client", "manager", "sales"), validate(createFollowUpTaskSchema), createFollowUpTask);
+router.patch("/:id/tasks/:taskId", requireRole("admin", "client", "manager", "sales"), validate(updateFollowUpTaskSchema), updateFollowUpTask);
+router.delete("/:id/tasks/:taskId", requireRole("admin", "client", "manager", "sales"), deleteFollowUpTask);
 
 export default router;

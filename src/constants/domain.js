@@ -9,12 +9,37 @@ export const ROLES = Object.freeze({
 
 export const ROLE_VALUES = Object.freeze(Object.values(ROLES));
 
-export const CRM_STATUSES = Object.freeze(["prospect", "lead", "customer", "inactive"]);
+// Updated CRM statuses to match new Lead Status field
+export const CRM_STATUSES = Object.freeze([
+  "new", "contacted", "qualified", "proposal_sent", "won", "lost",
+  // legacy values kept for backwards compatibility
+  "prospect", "lead", "customer", "inactive"
+]);
+
 export const CRM_PIPELINE_STAGES = Object.freeze(["new", "qualified", "hold", "proposition", "won", "lost"]);
 export const TICKET_STATUSES = Object.freeze(["open", "in_progress", "resolved", "closed", "pending", "archived"]);
 export const TICKET_PRIORITIES = Object.freeze(["low", "medium", "high", "urgent"]);
 export const TICKET_CRM_STAGES = Object.freeze(["none", "lead", "qualified", "opportunity", "proposal", "negotiation", "won", "lost"]);
 export const CHAT_STATUSES = Object.freeze(["active", "closed", "queued", "archived"]);
+
+/**
+ * Status transitions allowed for Sales role.
+ * Key = current status, Value = array of statuses they can move to.
+ */
+export const SALES_ALLOWED_STATUS_TRANSITIONS = Object.freeze({
+  new: ["new", "contacted"],
+  contacted: ["contacted", "qualified"],
+  qualified: ["qualified", "proposal_sent"],
+  proposal_sent: ["proposal_sent"],
+  // legacy statuses
+  prospect: ["prospect", "lead"],
+  lead: ["lead", "customer"],
+  customer: ["customer"],
+  inactive: ["inactive"],
+  // Sales cannot move won/lost
+  won: ["won"],
+  lost: ["lost"]
+});
 
 export const NOTIFICATION_TYPES = Object.freeze([
   "new_chat",
@@ -62,7 +87,8 @@ export const ACTIVITY_TYPES = Object.freeze([
   "merged",
   "transferred",
   "comment_added",
-  "settings_updated"
+  "settings_updated",
+  "auto_assigned"
 ]);
 
 export const FOLLOW_UP_TASK_TYPES = Object.freeze([
