@@ -3,6 +3,7 @@ import { ChatSession } from "../models/ChatSession.js";
 import { Ticket } from "../models/Ticket.js";
 import { User } from "../models/User.js";
 import { FollowUpTask } from "../models/FollowUpTask.js";
+import { Visitor } from "../models/Visitor.js";
 import { getOwnedWebsiteIds } from "../utils/roleUtils.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import AppError from "../utils/AppError.js";
@@ -16,6 +17,7 @@ import { createActivityEvent, listActivityForEntity } from "../services/activity
 import { getSocketServer } from "../sockets/index.js";
 import { PERMISSIONS, requirePermission } from "../utils/permissions.js";
 import { SALES_ALLOWED_STATUS_TRANSITIONS } from "../constants/domain.js";
+import { autoAssignLeadOwner } from "../services/automationService.js";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -33,7 +35,60 @@ async function createAndEmitCrmNotification({ recipient, type, title, message, l
 }
 
 function normalizeCompanyName(value = "") {
-  return String(value || "").trim().toLowerCase();
+  const str = String(value || "").trim();
+  const lower = str.toLowerCase();
+  if (lower === "undefined" || lower === "null") return "";
+  return lower;
+}
+
+function normalizePipelineStage(value = "") {
+  const stage = String(value || "").trim().toLowerCase();
+  if (["new", "contacted", "qualified", "proposal_sent", "negotiation", "won", "lost"].includes(stage)) return stage;
+  if (stage === "hold") return "contacted";
+  if (stage === "proposition") return "proposal_sent";
+  return "new";
+}
+
+function resolveStatusFromPipelineStage(stage) {
+  const normalizedStage = normalizePipelineStage(stage);
+  if (normalizedStage === "won") return "won";
+  if (normalizedStage === "lost") return "lost";
+  return normalizedStage;
+}
+
+function probabilityFromStage(stage) {
+  const map = {
+    new: 10,
+    contacted: 25,
+    qualified: 50,
+    proposal_sent: 70,
+    negotiation: 85,
+    won: 100,
+    lost: 0
+  };
+  return map[normalizePipelineStage(stage)] ?? 10;
+}
+
+async function buildChatContextFromSession(sessionId) {
+  if (!sessionId) return {};
+
+  const session = await ChatSession.findById(sessionId)
+    .populate("visitorId", "visitorId country city device browser os")
+    .select("visitorId currentPage firstPage");
+
+  if (!session) return {};
+
+  return {
+    sessionId: session._id,
+    pageUrl: session.currentPage || "",
+    firstPage: session.firstPage || "",
+    device: [
+      session.visitorId?.device,
+      session.visitorId?.browser,
+      session.visitorId?.os
+    ].filter(Boolean).join(" / "),
+    location: [session.visitorId?.city, session.visitorId?.country].filter(Boolean).join(", ")
+  };
 }
 
 function buildDuplicateFilters({ email, phone, companyName, websiteId, excludeId = null }) {
@@ -221,11 +276,17 @@ export const listCustomers = asyncHandler(async (req, res) => {
     const notesCount = doc.internalNotes?.length || 0;
     score += Math.min(15, notesCount * 3);
 
+    const pipelineProbability = Number(doc.probability ?? probabilityFromStage(doc.pipelineStage));
+    score += Math.round(pipelineProbability / 10);
+    if (doc.interestLevel === "hot") score += 10;
+    if (doc.interestLevel === "cold") score -= 10;
+
     doc.heatScore = Math.max(0, Math.min(100, Math.round(score)));
+    doc.probability = pipelineProbability;
     return doc;
   });
 
-  const [myLeads, dueToday, noFollowUp, wonThisMonth, archived] = await Promise.all([
+  const [myLeads, dueToday, noFollowUp, wonThisMonth, archived, lostReasons] = await Promise.all([
     Customer.countDocuments({ websiteId: query.websiteId, ownerId: req.user._id, archivedAt: null }),
     FollowUpTask.countDocuments({
       websiteId: query.websiteId,
@@ -240,11 +301,42 @@ export const listCustomers = asyncHandler(async (req, res) => {
       updatedAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
     }),
     Customer.countDocuments({ websiteId: query.websiteId, archivedAt: { $ne: null } })
+    ,
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, archivedAt: null, pipelineStage: "lost", lostReason: { $nin: ["", null] } } },
+      { $group: { _id: "$lostReason", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 5 }
+    ])
   ]);
+
+  const totalLeads = total;
+  const totalRevenue = customersWithHeat
+    .filter((customer) => customer.pipelineStage === "won")
+    .reduce((sum, customer) => sum + Number(customer.leadValue || 0), 0);
+  const pipelineValue = customersWithHeat
+    .filter((customer) => !["won", "lost"].includes(customer.pipelineStage))
+    .reduce((sum, customer) => sum + Number(customer.leadValue || 0), 0);
+  const avgProbability = customersWithHeat.length
+    ? Math.round(customersWithHeat.reduce((sum, customer) => sum + Number(customer.probability || 0), 0) / customersWithHeat.length)
+    : 0;
+  const conversionRate = totalLeads ? Number(((wonThisMonth / totalLeads) * 100).toFixed(1)) : 0;
 
   res.json({
     customers: customersWithHeat,
-    summary: { myLeads, dueToday, noFollowUp, wonThisMonth, archived },
+    summary: {
+      myLeads,
+      dueToday,
+      noFollowUp,
+      wonThisMonth,
+      archived,
+      totalLeads,
+      conversionRate,
+      revenue: totalRevenue,
+      pipelineValue,
+      avgProbability,
+      lostReasons
+    },
     pagination: {
       total,
       page: parseInt(page),
@@ -262,10 +354,14 @@ export const createCustomer = asyncHandler(async (req, res) => {
     companyName,
     leadSource,
     leadValue,
+    budget,
+    interestLevel,
+    probability,
     expectedCloseDate,
     websiteId,
     status,
     pipelineStage,
+    priority,
     ownerId,
     tags,
     notes,
@@ -282,7 +378,7 @@ export const createCustomer = asyncHandler(async (req, res) => {
     throw new AppError("Unauthorized access to this website's CRM data", 403);
   }
 
-  const existing = await Customer.findOne({ websiteId, email: String(email).trim().toLowerCase() });
+  const existing = await Customer.findOne({ websiteId: resolvedWebsiteId, email: String(email).trim().toLowerCase() });
   if (existing) {
     throw new AppError("A lead with this email already exists for the selected website", 409);
   }
@@ -291,8 +387,11 @@ export const createCustomer = asyncHandler(async (req, res) => {
     email,
     phone,
     companyName,
-    websiteId
+    websiteId: resolvedWebsiteId
   });
+  const sourceDetails = await buildChatContextFromSession(sessionId);
+  const normalizedPipelineStage = normalizePipelineStage(pipelineStage || status || "new");
+  const normalizedStatus = status || resolveStatusFromPipelineStage(normalizedPipelineStage);
 
   let resolvedOwnerId = null;
   if (ownerId) {
@@ -300,7 +399,7 @@ export const createCustomer = asyncHandler(async (req, res) => {
     if (!nextOwner) throw new AppError("Selected CRM owner was not found", 404);
     const assignedWebsiteIds = Array.isArray(nextOwner.websiteIds) ? nextOwner.websiteIds : [];
     const isLegacyTenantWide = assignedWebsiteIds.length === 0;
-    const isWebsiteScoped = isLegacyTenantWide || assignedWebsiteIds.some((id) => String(id) === String(websiteId));
+    const isWebsiteScoped = isLegacyTenantWide || assignedWebsiteIds.some((id) => String(id) === String(resolvedWebsiteId));
     const requiredManagerId = req.user.role === "admin"
       ? null
       : String(req.user.role === "client" ? req.user._id : req.user.managerId || "");
@@ -326,13 +425,32 @@ export const createCustomer = asyncHandler(async (req, res) => {
     companyName: normalizeCompanyName(companyName),
     leadSource: leadSource || "",
     leadValue: Number(leadValue || 0),
+    budget: Number(budget || 0),
+    interestLevel: interestLevel || "warm",
+    probability: Number(probability ?? probabilityFromStage(normalizedPipelineStage)),
     expectedCloseDate: expectedCloseDate ? new Date(expectedCloseDate) : null,
     websiteId: resolvedWebsiteId,
-    status: status || "new",
-    pipelineStage: pipelineStage || "new",
+    status: normalizedStatus,
+    pipelineStage: normalizedPipelineStage,
+    stageEnteredAt: new Date(),
+    stageHistory: [{
+      fromStage: "new",
+      toStage: normalizedPipelineStage,
+      changedBy: req.user._id,
+      changedAt: new Date(),
+      reason: "lead_created"
+    }],
     ownerId: resolvedOwnerId,
     ownerAssignedAt: resolvedOwnerId ? new Date() : null,
+    priority: priority || "medium",
     tags: Array.isArray(tags) ? tags : [],
+    sourceDetails,
+    score: Math.min(100, Math.max(0,
+      (sessionId ? 10 : 0) +
+      (notes ? 10 : 0) +
+      (priority === "high" ? 15 : priority === "medium" ? 8 : 3) +
+      (interestLevel === "hot" ? 20 : interestLevel === "warm" ? 10 : 0)
+    )),
     internalNotes: notes && String(notes).trim() ? [{
       text: String(notes).trim(),
       authorName: req.user.name,
@@ -346,7 +464,7 @@ export const createCustomer = asyncHandler(async (req, res) => {
     }] : []
   });
 
-  await incrementCustomers(websiteId);
+  await incrementCustomers(resolvedWebsiteId);
   if (resolvedOwnerId) {
     await createAndEmitCrmNotification({
       recipient: resolvedOwnerId,
@@ -358,13 +476,15 @@ export const createCustomer = asyncHandler(async (req, res) => {
   }
   await emitCustomerActivity({
     actor: req.user,
-    websiteId,
+    websiteId: resolvedWebsiteId,
     customerId: customer._id,
     type: "created",
     summary: `CRM lead ${customer.name} was created`,
     metadata: {
       crn: customer.crn,
       ownerId: resolvedOwnerId || null,
+      pipelineStage: customer.pipelineStage,
+      priority: customer.priority,
       duplicateCandidates: duplicateCandidates.map((candidate) => ({
         _id: candidate._id,
         name: candidate.name,
@@ -373,9 +493,27 @@ export const createCustomer = asyncHandler(async (req, res) => {
     }
   });
   if (duplicateCandidates.length > 0) {
+    const managerRecipient = req.user.role === "sales" ? (req.user.managerId || null) : null;
+    if (resolvedOwnerId) {
+      await createAndEmitCrmNotification({
+        recipient: resolvedOwnerId,
+        type: "crm_duplicate_detected",
+        title: "Possible duplicate lead detected",
+        message: `${duplicateCandidates.length} similar record(s) found for ${name}.`,
+        link: "/sales"
+      });
+    } else if (managerRecipient) {
+      await createAndEmitCrmNotification({
+        recipient: managerRecipient,
+        type: "crm_duplicate_detected",
+        title: "Possible duplicate lead detected",
+        message: `${duplicateCandidates.length} similar record(s) found for ${name}.`,
+        link: "/client?tab=crm"
+      });
+    }
     await emitCustomerActivity({
       actor: req.user,
-      websiteId,
+      websiteId: resolvedWebsiteId,
       customerId: customer._id,
       type: "duplicate_detected",
       summary: `${duplicateCandidates.length} potential CRM duplicates detected`,
@@ -387,7 +525,7 @@ export const createCustomer = asyncHandler(async (req, res) => {
     action: "crm.lead_created",
     entityType: "customer",
     entityId: customer._id,
-    websiteId,
+    websiteId: resolvedWebsiteId,
     metadata: {
       crn: customer.crn,
       email: customer.email,
@@ -400,7 +538,21 @@ export const createCustomer = asyncHandler(async (req, res) => {
   });
 
   if (sessionId) {
+    const linkedSession = await ChatSession.findById(sessionId).select("visitorId");
     await ChatSession.updateOne({ _id: sessionId }, { customerId: customer._id, crn: customer.crn });
+    if (linkedSession?.visitorId) {
+      await Visitor.updateOne({ _id: linkedSession.visitorId }, { customerId: customer._id, crn: customer.crn });
+    }
+  }
+
+  if (!customer.ownerId) {
+    const autoOwner = await autoAssignLeadOwner(customer, {
+      assignedBy: req.user._id,
+      reason: "create_customer_auto_assignment"
+    });
+    if (autoOwner) {
+      customer.ownerId = autoOwner._id;
+    }
   }
 
   const created = await Customer.findById(customer._id)
@@ -538,6 +690,11 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     companyName,
     leadSource,
     leadValue,
+    budget,
+    interestLevel,
+    probability,
+    priority,
+    lostReason,
     expectedCloseDate,
     ownerId,
     assignmentReason,
@@ -554,6 +711,11 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     companyName: customer.companyName,
     leadSource: customer.leadSource,
     leadValue: customer.leadValue,
+    budget: customer.budget,
+    interestLevel: customer.interestLevel,
+    probability: customer.probability,
+    priority: customer.priority,
+    lostReason: customer.lostReason,
     expectedCloseDate: customer.expectedCloseDate
   };
 
@@ -585,13 +747,37 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   }
 
   if (status) customer.status = status;
-  if (pipelineStage) customer.pipelineStage = pipelineStage;
+  if (pipelineStage) {
+    const nextStage = normalizePipelineStage(pipelineStage);
+    if (nextStage !== customer.pipelineStage) {
+      if (!customer.stageHistory) customer.stageHistory = [];
+      customer.stageHistory.unshift({
+        fromStage: customer.pipelineStage || "new",
+        toStage: nextStage,
+        changedBy: req.user._id,
+        changedAt: new Date(),
+        durationMs: customer.stageEnteredAt ? new Date() - new Date(customer.stageEnteredAt) : 0,
+        reason: assignmentReason || "manual_stage_update"
+      });
+      customer.pipelineStage = nextStage;
+      customer.stageEnteredAt = new Date();
+      customer.status = resolveStatusFromPipelineStage(nextStage);
+      if (probability === undefined) {
+        customer.probability = probabilityFromStage(nextStage);
+      }
+    }
+  }
   if (tags) customer.tags = tags;
   if (name) customer.name = name;
   if (phone) customer.phone = phone;
   if (companyName !== undefined) customer.companyName = normalizeCompanyName(companyName);
   if (leadSource !== undefined) customer.leadSource = leadSource || "";
   if (leadValue !== undefined) customer.leadValue = Number(leadValue || 0);
+  if (budget !== undefined) customer.budget = Number(budget || 0);
+  if (interestLevel !== undefined) customer.interestLevel = interestLevel || "warm";
+  if (probability !== undefined) customer.probability = Number(probability || 0);
+  if (priority !== undefined) customer.priority = priority || "medium";
+  if (lostReason !== undefined) customer.lostReason = lostReason || "";
   if (expectedCloseDate !== undefined) {
     customer.expectedCloseDate = expectedCloseDate ? new Date(expectedCloseDate) : null;
   }
@@ -648,6 +834,9 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     }
   }
 
+  customer.lastActivity = new Date();
+  customer.lastInteraction = new Date();
+
   await customer.save();
   await emitCustomerActivity({
     actor: req.user,
@@ -665,6 +854,11 @@ export const updateCustomer = asyncHandler(async (req, res) => {
         companyName: customer.companyName,
         leadSource: customer.leadSource,
         leadValue: customer.leadValue,
+        budget: customer.budget,
+        interestLevel: customer.interestLevel,
+        probability: customer.probability,
+        priority: customer.priority,
+        lostReason: customer.lostReason,
         expectedCloseDate: customer.expectedCloseDate
       }
     }
@@ -720,6 +914,20 @@ export const addCustomerNote = asyncHandler(async (req, res) => {
   });
 
   customer.lastInteraction = new Date();
+  customer.lastActivity = new Date();
+  if (type !== "note") {
+    if (!customer.communications) customer.communications = [];
+    customer.communications.unshift({
+      type: type === "manual_email" ? "email" : type,
+      direction: "outbound",
+      to: customer.email || "",
+      subject: type === "manual_email" ? "Manual email log" : `${type} log`,
+      body: noteText,
+      status: "logged",
+      sentBy: req.user._id,
+      sentAt: new Date()
+    });
+  }
   await customer.save();
 
   // Map interaction types to distinct activity events for better timeline visualization

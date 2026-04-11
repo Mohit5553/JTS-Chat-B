@@ -85,7 +85,7 @@ export function ticketCreatedTemplate({ ticketId, subject, statusUrl, priority =
 
 /** Ticket Updated (status change notification) */
 export function ticketUpdatedTemplate({ ticketId, subject, status, statusUrl, agentName, note }) {
-  const statusColors = { open: "#3b82f6", in_progress: "#f97316", resolved: "#22c55e", closed: "#64748b", pending: "#a855f7", archived: "#94a3b8" };
+  const statusColors = { open: "#3b82f6", in_progress: "#f97316", waiting: "#a855f7", resolved: "#22c55e", closed: "#64748b", pending: "#a855f7", archived: "#94a3b8" };
   const content = `
     <h2 style="margin:0 0 8px;color:#1e293b;font-size:20px;font-weight:800;">Your Ticket Has Been Updated</h2>
     <p style="margin:0 0 24px;color:#64748b;font-size:14px;line-height:1.7;">Your support ticket status has changed.</p>

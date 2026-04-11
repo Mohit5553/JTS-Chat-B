@@ -9,7 +9,18 @@ import geoip from "geoip-lite";
 import { UAParser } from "ua-parser-js";
 
 export async function registerVisitor({ website, visitorToken, ipAddress, deviceInfo, name, email }) {
-  const visitorId = visitorToken || generatePublicId("visitor");
+  // Strip literal "undefined" / "null" strings that may come from the widget
+  const cleanField = (val) => {
+    if (!val) return null;
+    const s = String(val).trim();
+    return (s.toLowerCase() === "undefined" || s.toLowerCase() === "null" || s === "") ? null : s;
+  };
+
+  const cleanToken = cleanField(visitorToken);
+  const cleanName  = cleanField(name);
+  const cleanEmail = cleanField(email);
+
+  const visitorId = cleanToken || generatePublicId("visitor");
   const existing = await Visitor.findOne({ visitorId, websiteId: website._id });
 
   // Parse UAs
@@ -31,8 +42,9 @@ export async function registerVisitor({ website, visitorToken, ipAddress, device
     existing.lastVisitTime = new Date();
     existing.deviceInfo = deviceInfo || existing.deviceInfo;
     existing.ipAddress = ipAddress || existing.ipAddress;
-    existing.name = name || existing.name;
-    existing.email = email || existing.email;
+    // Only update name/email if the cleansed value is non-null (don't overwrite real data with null)
+    if (cleanName) existing.name = cleanName;
+    if (cleanEmail) existing.email = cleanEmail;
     existing.city = location.city;
     existing.country = location.country;
     existing.timezone = location.timezone;
@@ -42,10 +54,10 @@ export async function registerVisitor({ website, visitorToken, ipAddress, device
     await existing.save();
 
     // If returning visitor now provides email/name and didn't have a CRN yet, upgrade their CRM record
-    if (!existing.crn && (name || email)) {
+    if (!existing.crn && (cleanName || cleanEmail)) {
       const customer = await getOrCreateCustomer({
-        name: name || existing.name,
-        email: email || existing.email,
+        name: cleanName || existing.name,
+        email: cleanEmail || existing.email,
         websiteId: website._id,
         visitorId: existing.visitorId
       });
@@ -67,8 +79,8 @@ export async function registerVisitor({ website, visitorToken, ipAddress, device
     browser,
     os,
     device,
-    name,
-    email,
+    name: cleanName,
+    email: cleanEmail,
     city: location.city,
     country: location.country,
     timezone: location.timezone
@@ -76,8 +88,8 @@ export async function registerVisitor({ website, visitorToken, ipAddress, device
 
   // CRN Integration: Create/update Customer record for ALL visitors (identified or anonymous)
   const customer = await getOrCreateCustomer({ 
-    name, 
-    email, 
+    name: cleanName, 
+    email: cleanEmail, 
     websiteId: website._id,
     visitorId: visitorId  // used as fallback unique key for anonymous visitors
   });

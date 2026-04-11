@@ -43,7 +43,45 @@ const websiteSchema = new mongoose.Schema(
       saturday:  { type: dayHoursSchema, default: () => ({ isOpen: false }) },
       sunday:    { type: dayHoursSchema, default: () => ({ isOpen: false }) },
     },
-    webhooks: [webhookSchema]
+    webhooks: [webhookSchema],
+    botEnabled: { type: Boolean, default: true },
+    botWelcomeMessage: { type: String, default: "Hi 👋 How can we help you today?" },
+    botFlow: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {
+        nodes: {
+          root: {
+            message: "Hi 👋 How can we help you?",
+            options: [
+              { text: "Sales", next: "sales" },
+              { text: "Support", next: "support" },
+              { text: "Billing", next: "billing" },
+              { text: "Technical", next: "technical" }
+            ]
+          },
+          support: {
+            message: "Which support area do you need help with?",
+            options: [
+              { text: "Login Issue", next: "support_login" },
+              { text: "Account Issue", next: "support_account" },
+              { text: "Payment Problem", next: "support_payment" }
+            ]
+          },
+          support_login: {
+            message: "Select your specific login issue:",
+            options: [
+              { text: "Forgot Password", next: "sol_forgot_password" },
+              { text: "OTP not received", next: "sol_otp" },
+              { text: "Invalid credentials", next: "sol_invalid_creds" }
+            ]
+          },
+          sol_forgot_password: {
+            message: "🔧 Solution:\n1. Click on \"Forgot Password\"\n2. Enter your email\n3. Check spam folder for OTP",
+            isSolution: true
+          }
+        }
+      }
+    }
   },
   { timestamps: true }
 );

@@ -111,7 +111,9 @@ export async function initVisitorSession(req, res) {
     sessionId: session.sessionId,
     session,
     messages: messagesWithNames,
-    website
+    website,
+    botStatus: session.botStatus,
+    botMetadata: session.botMetadata
   });
 }
 
@@ -304,10 +306,28 @@ export async function submitSessionFeedback(req, res) {
   }
 
   session.satisfactionStatus = satisfactionStatus;
-  session.satisfactionSubmittedAt = new Date();
-  await session.save();
-
   return res.json({ success: true, satisfactionStatus: session.satisfactionStatus });
+}
+
+export async function submitBotStatus(req, res) {
+  const { sessionId, botStatus, path, selections } = req.body;
+  const session = await ChatSession.findOne({ sessionId, websiteId: req.website._id });
+  if (!session) return res.status(404).json({ message: "Session not found" });
+
+  session.botStatus = botStatus;
+  if (botStatus === "resolved") {
+    session.resolvedByBot = true;
+    session.status = "closed";
+    session.closedAt = new Date();
+  }
+  
+  if (path) session.botMetadata.path = path;
+  if (selections) session.botMetadata.selections = selections;
+
+  await session.save();
+  emitSessionUpdate(await loadRealtimeSession(session._id));
+
+  return res.json({ success: true });
 }
 
 export async function getWidgetConfig(req, res) {
@@ -337,7 +357,10 @@ export async function getWidgetConfig(req, res) {
     showOfflineForm: !businessOpen || !isAgentOnline,
     lastActiveAt,
     quickReplies: website.quickReplies || [],
-    businessHours: website.businessHours || null
+    businessHours: website.businessHours || null,
+    botEnabled: website.botEnabled,
+    botWelcomeMessage: website.botWelcomeMessage,
+    botFlow: website.botFlow
   });
 }
 

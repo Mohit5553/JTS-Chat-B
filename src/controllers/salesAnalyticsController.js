@@ -2,7 +2,6 @@ import { Customer } from "../models/Customer.js";
 import { FollowUpTask } from "../models/FollowUpTask.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import { getOwnedWebsiteIds } from "../utils/roleUtils.js";
-import mongoose from "mongoose";
 
 /**
  * Get sales-focused analytics for the current user (if sales) or team (if manager/admin)
@@ -69,7 +68,7 @@ export const getSalesPerformanceStats = asyncHandler(async (req, res) => {
   const taskStats = await FollowUpTask.aggregate([
     { $match: { 
         customerId: { $in: await Customer.find(filter).distinct("_id") },
-        status: { $in: ["pending", "completed"] }
+        status: { $in: ["open", "in_progress", "completed"] }
       } 
     },
     { $group: {
@@ -90,6 +89,12 @@ export const getSalesPerformanceStats = asyncHandler(async (req, res) => {
   const totalPipelineValue = pipelineStats.reduce((sum, s) => sum + s.totalValue, 0);
   const wonStats = pipelineStats.find(s => s._id === "won");
   const wonRevenue = wonStats ? wonStats.totalValue : 0;
+  const lostReasonStats = await Customer.aggregate([
+    { $match: { ...filter, pipelineStage: "lost", lostReason: { $nin: ["", null] } } },
+    { $group: { _id: "$lostReason", count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 5 }
+  ]);
   
   res.json({
     summary: {
@@ -103,6 +108,7 @@ export const getSalesPerformanceStats = asyncHandler(async (req, res) => {
     interactions: interactionStats,
     sources: sourceStats,
     tasks: taskStats,
+    lostReasons: lostReasonStats,
     topLeads
   });
 });

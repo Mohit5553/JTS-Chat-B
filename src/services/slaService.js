@@ -6,6 +6,7 @@ import { env } from "../config/env.js";
 import { createNotification } from "./notificationService.js";
 import { sendEmail } from "./emailService.js";
 import { slaBreachTemplate } from "../utils/emailTemplates.js";
+import { processCrmAutomation, processTicketAutomation } from "./automationService.js";
 
 async function alertManager(manager, breachType, details, dashboardUrl) {
   await createNotification({
@@ -81,6 +82,9 @@ export async function processSlaBreaches() {
     ticket.resolutionAlertSentAt = new Date();
     await ticket.save();
   }
+
+  await processCrmAutomation();
+  await processTicketAutomation();
 }
 
 export function startSlaMonitor() {

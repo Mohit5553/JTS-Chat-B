@@ -11,13 +11,13 @@ export const ROLE_VALUES = Object.freeze(Object.values(ROLES));
 
 // Updated CRM statuses to match new Lead Status field
 export const CRM_STATUSES = Object.freeze([
-  "new", "contacted", "qualified", "proposal_sent", "won", "lost",
+  "new", "contacted", "qualified", "proposal_sent", "negotiation", "won", "lost",
   // legacy values kept for backwards compatibility
   "prospect", "lead", "customer", "inactive"
 ]);
 
-export const CRM_PIPELINE_STAGES = Object.freeze(["new", "qualified", "hold", "proposition", "won", "lost"]);
-export const TICKET_STATUSES = Object.freeze(["open", "in_progress", "resolved", "closed", "pending", "archived"]);
+export const CRM_PIPELINE_STAGES = Object.freeze(["new", "contacted", "qualified", "proposal_sent", "negotiation", "won", "lost"]);
+export const TICKET_STATUSES = Object.freeze(["open", "in_progress", "waiting", "resolved", "closed", "pending", "archived"]);
 export const TICKET_PRIORITIES = Object.freeze(["low", "medium", "high", "urgent"]);
 export const TICKET_CRM_STAGES = Object.freeze(["none", "lead", "qualified", "opportunity", "proposal", "negotiation", "won", "lost"]);
 export const CHAT_STATUSES = Object.freeze(["active", "closed", "queued", "archived"]);
@@ -30,7 +30,8 @@ export const SALES_ALLOWED_STATUS_TRANSITIONS = Object.freeze({
   new: ["new", "contacted"],
   contacted: ["contacted", "qualified"],
   qualified: ["qualified", "proposal_sent"],
-  proposal_sent: ["proposal_sent"],
+  proposal_sent: ["proposal_sent", "negotiation"],
+  negotiation: ["negotiation"],
   // legacy statuses
   prospect: ["prospect", "lead"],
   lead: ["lead", "customer"],
@@ -78,6 +79,9 @@ export const ACTIVITY_TYPES = Object.freeze([
   "stage_changed",
   "status_changed",
   "note_added",
+  "call_logged",
+  "meeting_logged",
+  "manual_email_logged",
   "email_sent",
   "task_created",
   "task_updated",
@@ -89,6 +93,7 @@ export const ACTIVITY_TYPES = Object.freeze([
   "comment_added",
   "settings_updated",
   "auto_assigned",
+  "sla_breached",
   "page_view"
 ]);
 

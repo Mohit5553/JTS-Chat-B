@@ -373,7 +373,7 @@ export function createSocketServer(httpServer) {
         }
 
         // Only explicitly allowed roles can send live messages
-        if (!["agent", "sales"].includes(user.role)) {
+        if (!["agent", "sales", "user"].includes(user.role)) {
           console.error(`[AGENT_STEP 1b]: Unauthorized message attempt by role: ${user.role}`);
           socket.emit("chat:error", { message: "Your role is restricted to observer-only for live chats." });
           return;

@@ -44,7 +44,13 @@ const chatSessionSchema = new mongoose.Schema(
     archivedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     archiveReason: { type: String, trim: true, default: "" },
     restoredAt: { type: Date, default: null },
-    restoredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }
+    restoredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    botStatus: { type: String, enum: ["idle", "in_progress", "resolved", "escalated"], default: "idle" },
+    resolvedByBot: { type: Boolean, default: false },
+    botMetadata: {
+      path: [{ type: String }],
+      selections: { type: mongoose.Schema.Types.Mixed, default: {} }
+    }
   },
   { timestamps: true }
 );

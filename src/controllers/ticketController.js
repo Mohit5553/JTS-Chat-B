@@ -18,6 +18,7 @@ import { Category } from "../models/Category.js";
 import { Customer } from "../models/Customer.js";
 import { getSocketServer } from "../sockets/index.js";
 import { PERMISSIONS, requirePermission } from "../utils/permissions.js";
+import { buildTicketSlaFields, inferTicketPriority } from "../services/automationService.js";
 
 function normalizeDepartment(value) {
   return String(value || "").trim().toLowerCase() || "general";
@@ -27,8 +28,11 @@ function mapTicketCrmStageToPipelineStage(crmStage) {
   const stage = String(crmStage || "").trim().toLowerCase();
   if (!stage || stage === "none") return null;
   if (stage === "lead") return "new";
+  if (stage === "contacted") return "contacted";
   if (stage === "qualified") return "qualified";
-  if (stage === "opportunity" || stage === "proposal" || stage === "negotiation") return "proposition";
+  if (stage === "opportunity") return "contacted";
+  if (stage === "proposal") return "proposal_sent";
+  if (stage === "negotiation") return "negotiation";
   if (stage === "won") return "won";
   if (stage === "lost") return "lost";
   return null;
@@ -459,7 +463,12 @@ export const createTicketFromChat = async (req, res) => {
       crn: session.crn || null,
       assignedAgent: autoAssignedAgent?._id || session.assignedAgent || req.user._id,
       subject: subject || "Support Request from Live Chat",
-      priority: priority || "medium",
+      priority: priority || inferTicketPriority({
+        subject,
+        category,
+        subcategory,
+        lastMessagePreview: session.lastMessagePreview
+      }),
       crmStage: crmStage || "none",
       category: matchedCategory?.name || category || "",
       subcategory: subcategory || "",
@@ -467,6 +476,7 @@ export const createTicketFromChat = async (req, res) => {
       status: "open",
       lastMessagePreview: session.lastMessagePreview
     });
+    Object.assign(ticket, buildTicketSlaFields(ticket.priority, ticket.createdAt || new Date()));
     if (ticket.assignedAgent) {
       pushAssignmentHistory(ticket, {
         assignedAgentId: ticket.assignedAgent,
@@ -480,9 +490,9 @@ export const createTicketFromChat = async (req, res) => {
     if (ticket.customerId && crmStage && crmStage !== "none") {
       const customer = await Customer.findById(ticket.customerId);
       if (customer) {
-        const nextStatus = crmStage === "won" ? "customer" : "lead";
+        const nextStatus = crmStage === "won" ? "won" : (crmStage === "lost" ? "lost" : "contacted");
         const nextPipelineStage = mapTicketCrmStageToPipelineStage(crmStage);
-        if (customer.status === "prospect" || customer.status === "inactive") {
+        if (["prospect", "inactive", "new"].includes(customer.status)) {
           customer.status = nextStatus;
         }
         if (nextPipelineStage) {
@@ -565,7 +575,19 @@ export const updateTicket = async (req, res) => {
         ticket.resolvedAt = new Date();
       }
     }
-    if (priority) ticket.priority = priority;
+    if (priority) {
+      ticket.priority = priority;
+      Object.assign(ticket, buildTicketSlaFields(ticket.priority, ticket.createdAt));
+    } else if (category !== undefined || subcategory !== undefined || note) {
+      ticket.priority = inferTicketPriority({
+        subject: ticket.subject,
+        category: category !== undefined ? category : ticket.category,
+        subcategory: subcategory !== undefined ? subcategory : ticket.subcategory,
+        note,
+        lastMessagePreview: ticket.lastMessagePreview
+      });
+      Object.assign(ticket, buildTicketSlaFields(ticket.priority, ticket.createdAt));
+    }
     if (crmStage || stage) {
       if (!["admin", "client", "manager", "sales"].includes(req.user.role)) {
         return res.status(403).json({ message: "Only sales or managers can change CRM stage." });
@@ -726,6 +748,9 @@ export const bulkUpdateTickets = async (req, res) => {
     const scopedTickets = await Ticket.find({ _id: { $in: ticketIds }, ...scope });
     for (const ticket of scopedTickets) {
       Object.assign(ticket, allowedUpdates);
+      if (allowedUpdates.priority) {
+        Object.assign(ticket, buildTicketSlaFields(ticket.priority, ticket.createdAt));
+      }
       if (updates.category !== undefined) {
         const matchedBulkCategory = updates.category
           ? await Category.findOne({
@@ -777,9 +802,10 @@ export const submitVisitorTicket = async (req, res) => {
       subject: subject || "Inquiry from Offline Widget",
       lastMessagePreview: message,
       status: "open",
-      priority: "medium",
+      priority: inferTicketPriority({ subject, note: message }),
       channel: "web"
     });
+    Object.assign(newTicket, buildTicketSlaFields(newTicket.priority, new Date()));
 
     await newTicket.save();
 
@@ -865,7 +891,7 @@ export const getVisitorHistory = async (req, res) => {
       },
       tickets,
       pastSessions,
-      hasOpenTickets: tickets.some((t) => t.status === "open" || t.status === "pending")
+      hasOpenTickets: tickets.some((t) => ["open", "waiting", "pending", "in_progress"].includes(t.status))
     });
   } catch (error) {
     res.status(500).json({ message: error.message });

@@ -8,16 +8,26 @@ const customerAssignmentHistorySchema = new mongoose.Schema({
   assignedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
+const customerStageHistorySchema = new mongoose.Schema({
+  fromStage: { type: String, enum: [...CRM_PIPELINE_STAGES], default: "new" },
+  toStage: { type: String, enum: [...CRM_PIPELINE_STAGES], required: true },
+  changedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  changedAt: { type: Date, default: Date.now },
+  durationMs: { type: Number, default: 0 },
+  reason: { type: String, trim: true, default: "" }
+}, { _id: false });
+
 const customerCommunicationSchema = new mongoose.Schema({
-  type: { type: String, enum: ["email"], default: "email" },
-  direction: { type: String, enum: ["outbound"], default: "outbound" },
-  to: { type: String, required: true, trim: true, lowercase: true },
-  subject: { type: String, required: true, trim: true },
-  body: { type: String, required: true },
-  status: { type: String, enum: ["sent", "logged"], default: "sent" },
+  type: { type: String, enum: ["email", "call", "whatsapp", "chat"], default: "email" },
+  direction: { type: String, enum: ["inbound", "outbound"], default: "outbound" },
+  to: { type: String, trim: true, lowercase: true, default: "" },
+  subject: { type: String, trim: true, default: "" },
+  body: { type: String, default: "" },
+  status: { type: String, enum: ["sent", "logged", "failed"], default: "sent" },
   sentBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
   ticketId: { type: mongoose.Schema.Types.ObjectId, ref: "Ticket", default: null },
   providerMessageId: { type: String, trim: true, default: "" },
+  meta: { type: mongoose.Schema.Types.Mixed, default: {} },
   attachments: [{
     filename: { type: String, trim: true, default: "" },
     url: { type: String, trim: true, default: "" }
@@ -34,6 +44,11 @@ const customerSchema = new mongoose.Schema(
     companyName: { type: String, trim: true, default: "" },
     leadSource: { type: String, trim: true, default: "" },
     leadValue: { type: Number, default: 0 },
+    budget: { type: Number, default: 0 },
+    interestLevel: { type: String, enum: ["cold", "warm", "hot"], default: "warm" },
+    probability: { type: Number, min: 0, max: 100, default: 10 },
+    score: { type: Number, default: 0 },
+    lostReason: { type: String, trim: true, default: "" },
     expectedCloseDate: { type: Date, default: null },
     websiteId: { type: mongoose.Schema.Types.ObjectId, ref: "Website", required: true },
     ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
@@ -53,6 +68,8 @@ const customerSchema = new mongoose.Schema(
       enum: [...CRM_PIPELINE_STAGES],
       default: "new"
     },
+    stageEnteredAt: { type: Date, default: Date.now },
+    stageHistory: [customerStageHistorySchema],
     tags: [{ type: String }],
     internalNotes: [{
       type: {
@@ -67,10 +84,18 @@ const customerSchema = new mongoose.Schema(
     }],
     firstInteraction: { type: Date, default: Date.now },
     lastInteraction: { type: Date, default: Date.now },
+    lastActivity: { type: Date, default: Date.now },
     lastFollowUpAt: { type: Date, default: null },
     nextFollowUpAt: { type: Date, default: null },
     assignmentHistory: [customerAssignmentHistorySchema],
     communications: [customerCommunicationSchema],
+    sourceDetails: {
+      sessionId: { type: mongoose.Schema.Types.ObjectId, ref: "ChatSession", default: null },
+      pageUrl: { type: String, trim: true, default: "" },
+      firstPage: { type: String, trim: true, default: "" },
+      device: { type: String, trim: true, default: "" },
+      location: { type: String, trim: true, default: "" }
+    },
     metadata: { type: Map, of: String },
     archivedAt: { type: Date, default: null, index: true },
     archivedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },

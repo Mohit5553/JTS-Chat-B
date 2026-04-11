@@ -79,6 +79,11 @@ export const updateCustomerSchema = z.object({
   companyName: z.string().max(120).optional(),
   leadSource: z.string().max(120).optional(),
   leadValue: z.number().min(0).optional(),
+  budget: z.number().min(0).optional(),
+  interestLevel: z.enum(["cold", "warm", "hot"]).optional(),
+  probability: z.number().min(0).max(100).optional(),
+  priority: z.enum(["low", "medium", "high"]).optional(),
+  lostReason: z.string().max(200).optional(),
   expectedCloseDate: z.union([z.string().max(40), z.null()]).optional(),
   ownerId: z.string().nullable().optional(),
   assignmentReason: z.string().max(200).optional(),
@@ -94,12 +99,18 @@ export const createCustomerSchema = z.object({
   companyName: z.string().trim().max(120).optional().or(z.literal("")),
   leadSource: z.string().trim().max(120).optional().or(z.literal("")),
   leadValue: z.number().min(0).optional().default(0),
+  budget: z.number().min(0).optional().default(0),
+  interestLevel: z.enum(["cold", "warm", "hot"]).optional().default("warm"),
+  probability: z.number().min(0).max(100).optional(),
+  priority: z.enum(["low", "medium", "high"]).optional().default("medium"),
   expectedCloseDate: z.string().max(40).optional().or(z.literal("")),
   websiteId: z.string().min(1, "Website is required"),
-  status: z.enum(CRM_STATUSES).default("lead"),
+  status: z.enum(CRM_STATUSES).default("new"),
   pipelineStage: z.enum(CRM_PIPELINE_STAGES).default("new"),
   ownerId: z.string().optional().or(z.literal("")).or(z.null()),
-  tags: z.array(z.string().trim().min(1)).max(20).optional().default([])
+  tags: z.array(z.string().trim().min(1)).max(20).optional().default([]),
+  notes: z.string().trim().max(2000).optional(),
+  sessionId: z.string().optional().or(z.literal(""))
 });
 
 export const sendCustomerEmailSchema = z.object({
