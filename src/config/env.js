@@ -34,8 +34,8 @@ if (process.env.NODE_ENV !== "test") {
     .filter(([, v]) => !v)
     .map(([k]) => `STRIPE_${k.toUpperCase()}_PRICE_ID`);
   if (missingPriceIds.length > 0) {
-    throw new Error(
-      `[env] ❌ Missing critical Stripe configuration: ${missingPriceIds.join(", ")}. Stripe checkout will not work without these environment variables.`
+    console.warn(
+      `[env] ⚠️ Missing Stripe price ID env vars: ${missingPriceIds.join(", ")}. Stripe checkout will fail until these are set.`
     );
   }
 }
