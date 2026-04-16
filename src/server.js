@@ -1,3 +1,4 @@
+import { logger } from "./utils/logger.js";
 import http from "http";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
@@ -8,16 +9,16 @@ import { startSlaMonitor } from "./services/slaService.js";
 async function bootstrap() {
   try {
     await connectDatabase();
-    console.log("Database connected");
+    logger.log("Database connected");
 
     const app = createApp();
     const server = http.createServer(app);
 
     createSocketServer(server);
-    console.log("Socket server initialized");
+    logger.log("Socket server initialized");
 
     startSlaMonitor();
-    console.log("SLA monitor initialized");
+    logger.log("SLA monitor initialized");
 
     server.on("error", (error) => {
       if (error.code === "EADDRINUSE") {
@@ -29,7 +30,7 @@ async function bootstrap() {
     });
 
     server.listen(env.port, () => {
-      console.log(`Server running on port ${env.port}`);
+      logger.log(`Server running on port ${env.port}`);
     });
   } catch (error) {
     console.error("Failed to start server:", error);

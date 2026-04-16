@@ -230,3 +230,15 @@ export const disableTwoFactor = asyncHandler(async (req, res, next) => {
 
   res.json({ success: true, twoFactorEnabled: false });
 });
+
+export const refresh = asyncHandler(async (req, res) => {
+  await logAuditEvent({
+    actor: req.user,
+    action: "auth.token.refreshed",
+    entityType: "user",
+    entityId: req.user._id,
+    ipAddress: req.ip
+  });
+
+  return createSendToken(await serializeUser(req.user), 200, res);
+});

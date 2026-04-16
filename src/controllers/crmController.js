@@ -4,26 +4,74 @@ import { Ticket } from "../models/Ticket.js";
 import { User } from "../models/User.js";
 import { FollowUpTask } from "../models/FollowUpTask.js";
 import { Visitor } from "../models/Visitor.js";
+import { Quotation } from "../models/Quotation.js";
+import { generateQuotationPDF } from "../services/pdfService.js";
+import { Analytics } from "../models/Analytics.js";
 import { getOwnedWebsiteIds } from "../utils/roleUtils.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import AppError from "../utils/AppError.js";
 import { sendEmail } from "../services/emailService.js";
 import { salesOutreachTemplate } from "../utils/emailTemplates.js";
 import { generateCRN } from "../services/customerService.js";
-import { incrementCustomers } from "../services/analyticsService.js";
+import { incrementCustomers, addWonRevenue, recordConversionTime } from "../services/analyticsService.js";
 import { createNotification } from "../services/notificationService.js";
 import { logAuditEvent } from "../services/auditService.js";
 import { createActivityEvent, listActivityForEntity } from "../services/activityService.js";
 import { getSocketServer } from "../sockets/index.js";
 import { PERMISSIONS, requirePermission } from "../utils/permissions.js";
-import { SALES_ALLOWED_STATUS_TRANSITIONS } from "../constants/domain.js";
-import { autoAssignLeadOwner } from "../services/automationService.js";
+import { formatCurrency } from "../utils/formatters.js";
+import {
+  CRM_DEAL_STAGES,
+  CRM_LEAD_STATUSES,
+  CRM_LOST_REASONS,
+  CRM_RECORD_TYPES,
+  SALES_ALLOWED_STATUS_TRANSITIONS
+} from "../constants/domain.js";
+import {
+  autoAssignLeadOwner,
+  ensureFirstTouchTask,
+  sendCrmLifecycleEmail
+} from "../services/automationService.js";
+import {
+  calculateWinProbability,
+  getNextBestAction,
+  calculateChurnRisk,
+  calculateHeatScore
+} from "../services/intelligenceService.js";
+import { calculateCustomerLTV } from "../services/revenueService.js";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const uploadsDir = path.resolve(__dirname, "../../uploads");
+
+const enrichmentCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function getEnrichedData(doc) {
+  const cacheKey = doc._id.toString();
+  const cached = enrichmentCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    return cached.data;
+  }
+
+  const [nba, ltv] = await Promise.all([
+    getNextBestAction(doc),
+    doc.status === "customer" ? calculateCustomerLTV(doc._id) : Promise.resolve(0)
+  ]);
+
+  const data = { nba, ltv };
+  enrichmentCache.set(cacheKey, { timestamp: Date.now(), data });
+
+  // Basic cleanup to prevent memory leak
+  if (enrichmentCache.size > 1000) {
+    const oldest = enrichmentCache.keys().next().value;
+    enrichmentCache.delete(oldest);
+  }
+
+  return data;
+}
 
 async function createAndEmitCrmNotification({ recipient, type, title, message, link }) {
   const notification = await createNotification({ recipient, type, title, message, link });
@@ -43,9 +91,9 @@ function normalizeCompanyName(value = "") {
 
 function normalizePipelineStage(value = "") {
   const stage = String(value || "").trim().toLowerCase();
-  if (["new", "contacted", "qualified", "proposal_sent", "negotiation", "won", "lost"].includes(stage)) return stage;
+  if (["new", "contacted", "qualified", "proposal", "negotiation", "won", "lost"].includes(stage)) return stage;
   if (stage === "hold") return "contacted";
-  if (stage === "proposition") return "proposal_sent";
+  if (stage === "proposal_sent" || stage === "proposition") return "proposal";
   return "new";
 }
 
@@ -61,12 +109,131 @@ function probabilityFromStage(stage) {
     new: 10,
     contacted: 25,
     qualified: 50,
-    proposal_sent: 70,
+    proposal: 70,
     negotiation: 85,
     won: 100,
     lost: 0
   };
   return map[normalizePipelineStage(stage)] ?? 10;
+}
+
+function normalizeRecordType(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (CRM_RECORD_TYPES.includes(normalized)) return normalized;
+  if (normalized === "client") return "customer";
+  return "lead";
+}
+
+function normalizeLeadStatus(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  const validStages = ["new", "contacted", "qualified", "proposal", "negotiation", "won", "lost"];
+  if (validStages.includes(normalized)) return normalized;
+  return "new";
+}
+
+function normalizeDealStage(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (CRM_DEAL_STAGES.includes(normalized)) return normalized;
+  if (normalized === "proposal_sent") return "proposal";
+  return null;
+}
+
+function deriveLifecycleFields({
+  pipelineStage,
+  recordType,
+  leadStatus,
+  dealStage
+} = {}) {
+  const normalizedPipelineStage = normalizePipelineStage(pipelineStage);
+
+  // High-priority: explicit 'won' moves lead to customer
+  if (normalizedPipelineStage === "won") {
+    return {
+      recordType: "customer",
+      leadStatus: "qualified",
+      dealStage: "won",
+      pipelineStage: "won",
+      status: "won"
+    };
+  }
+
+  // Lost leads
+  if (normalizedPipelineStage === "lost") {
+    return {
+      recordType: "deal",
+      leadStatus: "qualified",
+      dealStage: "lost",
+      pipelineStage: "lost",
+      status: "lost"
+    };
+  }
+
+  // Strategy: Pipeline stage is our master indicator.
+  // We promote to 'deal' for any stage that is 'qualified' or higher.
+  const isDealStage = ["qualified", "proposal", "negotiation"].includes(normalizedPipelineStage);
+  const isLeadStage = ["new", "contacted"].includes(normalizedPipelineStage);
+
+  if (isDealStage) {
+    return {
+      recordType: "deal",
+      leadStatus: "qualified",
+      dealStage: normalizedPipelineStage,
+      pipelineStage: normalizedPipelineStage,
+      status: normalizedPipelineStage
+    };
+  }
+
+  return {
+    recordType: "lead",
+    leadStatus: normalizedPipelineStage,
+    dealStage: null,
+    pipelineStage: normalizedPipelineStage,
+    status: normalizedPipelineStage
+  };
+}
+
+function computeLeadScore(customerLike = {}) {
+  const budget = Number(customerLike.budget || 0);
+  const notesCount = customerLike.internalNotes?.length || 0;
+  const communicationsCount = customerLike.communications?.length || 0;
+  const source = String(customerLike.leadSource || "").toLowerCase();
+  const score =
+    (budget >= 100000 ? 30 : budget >= 50000 ? 22 : budget > 0 ? 12 : 0) +
+    (communicationsCount >= 5 ? 25 : communicationsCount >= 2 ? 15 : communicationsCount > 0 ? 8 : 0) +
+    (notesCount >= 4 ? 15 : notesCount >= 2 ? 10 : notesCount > 0 ? 5 : 0) +
+    (["referral", "google", "website"].includes(source) ? 15 : source ? 8 : 0) +
+    (customerLike.lastFollowUpAt ? 10 : 0) +
+    (customerLike.requirement ? 10 : 0) +
+    (customerLike.timeline ? 10 : 0);
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function categoryFromScore(score) {
+  if (score >= 75) return "hot";
+  if (score >= 40) return "warm";
+  return "cold";
+}
+
+function expectedRevenueFromCustomer(customerLike = {}) {
+  return Math.round((Number(customerLike.leadValue || 0) * Number(customerLike.probability || 0)) / 100);
+}
+
+function validateLifecycleTransition(current, next, isNew = false) {
+  const currentType = normalizeRecordType(current.recordType);
+  const nextType = normalizeRecordType(next.recordType);
+
+  if (isNew && nextType === "customer") {
+    throw new AppError("Cannot create a new record directly as a 'customer'. Must start as a 'lead'.", 400);
+  }
+
+  if (!isNew && currentType === "lead" && nextType === "customer") {
+    throw new AppError("Lead must first be converted to a deal before becoming a customer", 400);
+  }
+
+  if (nextType === "customer" && normalizeDealStage(next.dealStage) !== "won") {
+    throw new AppError("Only won deals can become customers", 400);
+  }
 }
 
 async function buildChatContextFromSession(sessionId) {
@@ -87,6 +254,10 @@ async function buildChatContextFromSession(sessionId) {
       session.visitorId?.browser,
       session.visitorId?.os
     ].filter(Boolean).join(" / "),
+    duration: session.createdAt && session.lastMessageAt
+      ? `${Math.floor((new Date(session.lastMessageAt) - new Date(session.createdAt)) / 60000)} min`
+      : "Unknown",
+    timestamp: session.createdAt,
     location: [session.visitorId?.city, session.visitorId?.country].filter(Boolean).join(", ")
   };
 }
@@ -157,16 +328,19 @@ async function buildCustomerPayload(customerId) {
       .populate("completedBy", "name email role")
       .sort({ dueAt: 1, createdAt: -1 })
       .limit(50),
-    listActivityForEntity({ 
-      entityType: "customer", 
-      entityId: customer._id, 
+    listActivityForEntity({
+      entityType: "customer",
+      entityId: customer._id,
       visitorId: visitor?.visitorId || null,
-      limit: 100 
+      limit: 100
     })
   ]);
 
   return { customer, tasks, activity };
 }
+
+
+
 
 /**
  * List all customers for the current user's websites.
@@ -182,7 +356,11 @@ export const listCustomers = asyncHandler(async (req, res) => {
     page = 1,
     limit = 20,
     includeArchived = "false",
-    view = ""
+    view = "",
+    leadSource,
+    healthStatus,
+    pipelineStage,
+    range = "month"
   } = req.query;
 
   // Safety guard: no owned websites means no data access
@@ -203,15 +381,15 @@ export const listCustomers = asyncHandler(async (req, res) => {
     }
     query.websiteId = websiteId;
   } else {
-    // Otherwise, show all owned websites
+    // If no websiteId specified, narrow the scope to only websites they own
     query.websiteId = { $in: ownedWebsiteIds };
   }
 
   if (status) query.status = status;
-  if (ownerId) query.ownerId = ownerId;
-  if (includeArchived !== "true") {
-    query.archivedAt = null;
-  }
+  if (req.query.recordType && req.query.recordType !== "all") query.recordType = req.query.recordType;
+  if (req.query.ownerId) query.ownerId = req.query.ownerId;
+  if (includeArchived !== "true") query.archivedAt = null;
+
   if (search) {
     query.$or = [
       { name: new RegExp(search, "i") },
@@ -232,14 +410,32 @@ export const listCustomers = asyncHandler(async (req, res) => {
     query.ownerId = req.user._id;
   } else if (view === "due_today") {
     query.ownerId = req.user._id;
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const dueTasks = await FollowUpTask.find({
+      ownerId: req.user._id,
+      status: { $in: ["open", "in_progress"] },
+      dueAt: { $lte: endOfToday }
+    }).select("customerId");
+    query._id = { $in: dueTasks.map(t => t.customerId) };
   } else if (view === "no_follow_up") {
-    query.$and = [...(query.$and || []), { nextFollowUpAt: null }];
+    query.nextFollowUpAt = null;
   } else if (view === "won_this_month") {
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     query.pipelineStage = "won";
     query.updatedAt = { $gte: startOfMonth };
   } else if (view === "archived") {
     query.archivedAt = { $ne: null };
+  }
+
+  // Drill-down Filters
+  if (leadSource) query.leadSource = leadSource;
+  if (pipelineStage) query.pipelineStage = pipelineStage;
+  if (healthStatus === "overdue") {
+    query.nextFollowUpAt = { $lt: now };
+  } else if (healthStatus === "stale") {
+    query.updatedAt = { $lt: new Date(now - 3 * 24 * 60 * 60 * 1000) };
+  } else if (healthStatus === "critical") {
+    query.updatedAt = { $lt: new Date(now - 7 * 24 * 60 * 60 * 1000) };
   }
 
   const customers = await Customer.find(query)
@@ -251,48 +447,135 @@ export const listCustomers = asyncHandler(async (req, res) => {
 
   const total = await Customer.countDocuments(query);
 
-  // Calculate dynamic heat scores for the current results
-  const nowTime = new Date();
+  // Calculate dynamic data for the current results
+  const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const customersWithHeat = customers.map(c => {
     const doc = c.toObject();
     let score = 40; // baseline
 
-    // 1. Lead Value factor (0-20 pts)
+    // Heat calculation logic
     score += Math.min(20, (doc.leadValue || 0) / 1000);
-
-    // 2. Recency factor (0-30 pts)
-    const daysSinceTouch = (nowTime - new Date(doc.lastInteraction)) / (1000 * 60 * 60 * 24);
+    const daysSinceTouch = (now - new Date(doc.lastInteraction)) / (1000 * 60 * 60 * 24);
     if (daysSinceTouch < 2) score += 30;
     else if (daysSinceTouch < 5) score += 15;
     else if (daysSinceTouch < 10) score += 5;
-
-    // 3. Negative Decay (-3 per day, max -40)
     score -= Math.min(40, daysSinceTouch * 3);
-
-    // 4. Priority boost
     if (doc.priority === "high") score += 10;
-    
-    // 5. Activity depth (Internal notes count)
-    const notesCount = doc.internalNotes?.length || 0;
-    score += Math.min(15, notesCount * 3);
+    const nC = doc.internalNotes?.length || 0;
+    score += Math.min(15, nC * 3);
 
-    const pipelineProbability = Number(doc.probability ?? probabilityFromStage(doc.pipelineStage));
-    score += Math.round(pipelineProbability / 10);
-    if (doc.interestLevel === "hot") score += 10;
-    if (doc.interestLevel === "cold") score -= 10;
+    const computedLeadScore = computeLeadScore(doc);
+    doc.score = computedLeadScore;
+    doc.leadCategory = doc.leadCategory || categoryFromScore(computedLeadScore);
+    doc.expectedRevenue = expectedRevenueFromCustomer(doc);
 
-    doc.heatScore = Math.max(0, Math.min(100, Math.round(score)));
-    doc.probability = pipelineProbability;
+    // Tier 2: Intelligence Enrichment
+    doc.heatScore = calculateHeatScore(doc); // Automated Heat Score
+    doc.probability = calculateWinProbability(doc);
+
+    // Churn Risk for customers
+    if (doc.status === "customer") {
+      doc.churnRisk = calculateChurnRisk(doc);
+    }
+
     return doc;
   });
 
-  const [myLeads, dueToday, noFollowUp, wonThisMonth, archived, lostReasons] = await Promise.all([
+  // Enrichment for individual results (NBA and LTV are async/heavy, so we do them on the enriched slice)
+  const finalCustomers = await Promise.all(customersWithHeat.map(async (doc) => {
+    const enriched = await getEnrichedData(doc);
+
+    doc.nbaRecommendation = enriched.nba ? `${enriched.nba.action}: ${enriched.nba.recommendation}` : "";
+    doc.nbaMetadata = enriched.nba; // Full object for UI icons/priority
+
+    if (doc.status === "customer") {
+      doc.ltv = enriched.ltv;
+    }
+
+    return doc;
+  }));
+
+  // Calculate summary statistics accurately across the entire website/agent scope (not just current page)
+  const summaryMatch = { websiteId: query.websiteId, archivedAt: null };
+
+  if (range === "today") {
+    summaryMatch.createdAt = { $gte: new Date(new Date().setHours(0, 0, 0, 0)) };
+  } else if (range === "week") {
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    summaryMatch.createdAt = { $gte: weekAgo };
+  } else if (range === "month") {
+    summaryMatch.createdAt = { $gte: new Date(now.getFullYear(), now.getMonth(), 1) };
+  }
+
+  const [summaryAgg] = await Customer.aggregate([
+    { $match: summaryMatch },
+    {
+      $group: {
+        _id: null,
+        totalRevenue: {
+          $sum: { $cond: [{ $eq: ["$pipelineStage", "won"] }, "$leadValue", 0] }
+        },
+        pipelineValue: {
+          $sum: { $cond: [{ $not: [{ $in: ["$pipelineStage", ["won", "lost"]] }] }, "$leadValue", 0] }
+        },
+        weightedRevenue: {
+          $sum: {
+            $cond: [
+              { $not: [{ $in: ["$pipelineStage", ["won", "lost"]] }] },
+              {
+                $multiply: [
+                  { $ifNull: ["$leadValue", 0] },
+                  { $divide: [{ $convert: { input: { $ifNull: ["$probability", 10] }, to: "double" } }, 100] }
+                ]
+              },
+              0
+            ]
+          }
+        },
+        avgProbability: { $avg: "$probability" },
+        aging_0_2: {
+          $sum: { $cond: [{ $gte: ["$updatedAt", new Date(now - 2 * 24 * 60 * 60 * 1000)] }, 1, 0] }
+        },
+        aging_3_7: {
+          $sum: {
+            $cond: [
+              {
+                $and: [
+                  { $lt: ["$updatedAt", new Date(now - 2 * 24 * 60 * 60 * 1000)] },
+                  { $gte: ["$updatedAt", new Date(now - 7 * 24 * 60 * 60 * 1000)] }
+                ]
+              },
+              1,
+              0
+            ]
+          }
+        },
+        aging_7_plus: {
+          $sum: { $cond: [{ $lt: ["$updatedAt", new Date(now - 7 * 24 * 60 * 60 * 1000)] }, 1, 0] }
+        },
+        totalLTV: {
+          $sum: { $cond: [{ $eq: ["$status", "customer"] }, "$leadValue", 0] }
+        },
+        customerCount: {
+          $sum: { $cond: [{ $eq: ["$status", "customer"] }, 1, 0] }
+        }
+      }
+    }
+  ]);
+
+  const [myLeads, dueToday, noFollowUp, wonThisMonth, archived, lostReasons, stageBreakdown, agents, analytics, leadsBySource, followUpHealth, agentTasks, lostByStageRaw, leadsPerDay, prevMonthStats, lostByStage, dropOffByCategory] = await Promise.all([
     Customer.countDocuments({ websiteId: query.websiteId, ownerId: req.user._id, archivedAt: null }),
     FollowUpTask.countDocuments({
       websiteId: query.websiteId,
       ownerId: req.user._id,
       status: { $in: ["open", "in_progress"] },
-      dueAt: { $lte: new Date(new Date().setHours(23, 59, 59, 999)) }
+      dueAt: {
+        $gte: new Date(new Date().setHours(0, 0, 0, 0)),
+        $lte: new Date(new Date().setHours(23, 59, 59, 999))
+      }
     }),
     Customer.countDocuments({ websiteId: query.websiteId, archivedAt: null, nextFollowUpAt: null }),
     Customer.countDocuments({
@@ -300,42 +583,136 @@ export const listCustomers = asyncHandler(async (req, res) => {
       pipelineStage: "won",
       updatedAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
     }),
-    Customer.countDocuments({ websiteId: query.websiteId, archivedAt: { $ne: null } })
-    ,
+    Customer.countDocuments({ websiteId: query.websiteId, archivedAt: { $ne: null } }),
     Customer.aggregate([
       { $match: { websiteId: query.websiteId, archivedAt: null, pipelineStage: "lost", lostReason: { $nin: ["", null] } } },
       { $group: { _id: "$lostReason", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
       { $limit: 5 }
+    ]),
+    Customer.aggregate([
+      { $match: summaryMatch },
+      { $group: { _id: "$pipelineStage", count: { $sum: 1 }, totalValue: { $sum: "$leadValue" } } }, // Fixing field name to totalValue for UI
+      { $sort: { count: -1 } }
+    ]),
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, pipelineStage: "won", ownerId: { $ne: null } } },
+      {
+        $group: {
+          _id: "$ownerId",
+          deals: { $sum: 1 },
+          revenue: { $sum: "$leadValue" }
+        }
+      },
+      { $lookup: { from: "users", localField: "_id", foreignField: "_id", as: "agent" } },
+      { $unwind: "$agent" },
+      { $project: { name: "$agent.name", email: "$agent.email", deals: 1, revenue: 1 } },
+      { $sort: { revenue: -1 } },
+      { $limit: 10 }
+    ]),
+    Analytics.findOne({ websiteId: query.websiteId }),
+    Customer.aggregate([
+      { $match: { ...summaryMatch, leadSource: { $ne: null } } },
+      { $group: { _id: "$leadSource", count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]),
+    FollowUpTask.aggregate([
+      { $match: { websiteId: query.websiteId } },
+      {
+        $group: {
+          _id: null,
+          overdue: { $sum: { $cond: [{ $and: [{ $lt: ["$dueAt", now] }, { $eq: ["$status", "open"] }] }, 1, 0] } },
+          completedToday: { $sum: { $cond: [{ $gte: ["$completedAt", new Date(new Date().setHours(0, 0, 0, 0))] }, 1, 0] } },
+          totalOpen: { $sum: { $cond: [{ $eq: ["$status", "open"] }, 1, 0] } }
+        }
+      }
+    ]),
+    FollowUpTask.aggregate([
+      { $match: { websiteId: query.websiteId, status: "completed" } },
+      { $group: { _id: "$ownerId", count: { $sum: 1 } } }
+    ]),
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, pipelineStage: "lost" } },
+      { $group: { _id: "$status", count: { $sum: 1 }, sources: { $push: "$leadSource" } } } // Note: we'll use more granular aggregation for 'dropped at stage'
+    ]),
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, createdAt: { $gte: sevenDaysAgo } } },
+      { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, count: { $sum: 1 } } },
+      { $sort: { "_id": 1 } }
+    ]),
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, pipelineStage: "won", updatedAt: { $gte: lastMonthStart, $lte: lastMonthEnd } } },
+      { $group: { _id: null, revenue: { $sum: "$leadValue" }, deals: { $sum: 1 } } }
+    ]),
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, pipelineStage: "lost", archivedAt: null } },
+      {
+        $project: {
+          lastStage: {
+            $arrayElemAt: [
+              {
+                $filter: {
+                  input: "$stageHistory",
+                  as: "sh",
+                  cond: { $ne: ["$$sh.stage", "lost"] }
+                }
+              },
+              -1
+            ]
+          }
+        }
+      },
+      { $group: { _id: null, stages: { $push: { $ifNull: ["$lastStage.stage", "unknown"] } } } }
+    ]),
+    Customer.aggregate([
+      { $match: { websiteId: query.websiteId, pipelineStage: "lost" } },
+      { $group: { _id: "$leadCategory", count: { $sum: 1 } } } // Bonus drop-off insight
     ])
   ]);
 
-  const totalLeads = total;
-  const totalRevenue = customersWithHeat
-    .filter((customer) => customer.pipelineStage === "won")
-    .reduce((sum, customer) => sum + Number(customer.leadValue || 0), 0);
-  const pipelineValue = customersWithHeat
-    .filter((customer) => !["won", "lost"].includes(customer.pipelineStage))
-    .reduce((sum, customer) => sum + Number(customer.leadValue || 0), 0);
-  const avgProbability = customersWithHeat.length
-    ? Math.round(customersWithHeat.reduce((sum, customer) => sum + Number(customer.probability || 0), 0) / customersWithHeat.length)
-    : 0;
-  const conversionRate = totalLeads ? Number(((wonThisMonth / totalLeads) * 100).toFixed(1)) : 0;
+  // Enrich agents with task counts
+  const agentTaskMap = (agentTasks || []).reduce((acc, t) => {
+    if (t._id) acc[String(t._id)] = t.count;
+    return acc;
+  }, {});
+
+  const enrichedAgents = agents.map(a => ({
+    ...a,
+    tasks: a._id ? (agentTaskMap[String(a._id)] || 0) : 0
+  }));
 
   res.json({
-    customers: customersWithHeat,
+    customers: finalCustomers,
     summary: {
       myLeads,
       dueToday,
       noFollowUp,
       wonThisMonth,
       archived,
-      totalLeads,
-      conversionRate,
-      revenue: totalRevenue,
-      pipelineValue,
-      avgProbability,
-      lostReasons
+      totalLeads: total,
+      conversionRate: total ? Number(((wonThisMonth / total) * 100).toFixed(1)) : 0,
+      revenue: summaryAgg?.totalRevenue || 0,
+      pipelineValue: summaryAgg?.pipelineValue || 0,
+      weightedRevenue: Math.round(summaryAgg?.weightedRevenue || 0),
+      avgProbability: Math.round(summaryAgg?.avgProbability || 0),
+      aging: {
+        recent: summaryAgg?.aging_0_2 || 0,
+        stale: summaryAgg?.aging_3_7 || 0,
+        dormant: summaryAgg?.aging_7_plus || 0
+      },
+      ltv: summaryAgg?.customerCount ? Math.round(summaryAgg.totalLTV / summaryAgg.customerCount) : 0,
+      cac: analytics?.cac || 0,
+      agents: enrichedAgents,
+      leadsBySource,
+      leadsPerDay,
+      followUpHealth: followUpHealth[0] || { overdue: 0, completedToday: 0, totalOpen: 0 },
+      lostReasons,
+      lostByStage,
+      comparison: {
+        prevMonthRevenue: prevMonthStats[0]?.revenue || 0,
+        prevMonthDeals: prevMonthStats[0]?.deals || 0
+      },
+      stageBreakdown
     },
     pagination: {
       total,
@@ -352,12 +729,19 @@ export const createCustomer = asyncHandler(async (req, res) => {
     email,
     phone,
     companyName,
+    recordType,
+    leadStatus,
+    dealStage,
     leadSource,
     leadValue,
     budget,
+    requirement,
+    timeline,
     interestLevel,
+    leadCategory,
     probability,
     expectedCloseDate,
+    decisionMaker,
     websiteId,
     status,
     pipelineStage,
@@ -390,8 +774,17 @@ export const createCustomer = asyncHandler(async (req, res) => {
     websiteId: resolvedWebsiteId
   });
   const sourceDetails = await buildChatContextFromSession(sessionId);
-  const normalizedPipelineStage = normalizePipelineStage(pipelineStage || status || "new");
-  const normalizedStatus = status || resolveStatusFromPipelineStage(normalizedPipelineStage);
+  const lifecycle = deriveLifecycleFields({
+    pipelineStage: pipelineStage || status || leadStatus || dealStage || "new",
+    recordType,
+    leadStatus,
+    dealStage
+  });
+  validateLifecycleTransition(
+    { recordType: "lead", leadStatus: lifecycle.leadStatus, dealStage: null },
+    lifecycle,
+    true
+  );
 
   let resolvedOwnerId = null;
   if (ownerId) {
@@ -417,25 +810,61 @@ export const createCustomer = asyncHandler(async (req, res) => {
     resolvedOwnerId = req.user._id;
   }
 
+  /*
+  if (lifecycle.recordType !== "lead") {
+    if (!requirement || !timeline || budget === undefined || budget === null || !leadSource) {
+      throw new AppError("Qualified records require budget, requirement, timeline, and source", 400);
+    }
+  }
+  if (["deal", "customer"].includes(lifecycle.recordType)) {
+    if (!Number(leadValue || 0)) {
+      throw new AppError("No deal without value", 400);
+    }
+    if (!decisionMaker) {
+      throw new AppError("Decision maker is required for deals", 400);
+    }
+  }
+  */
+  if (lifecycle.dealStage === "lost" && !req.body.lostReason) {
+    throw new AppError("Lost deals require a lost reason", 400);
+  }
+
+  const computedScore = computeLeadScore({
+    budget,
+    leadSource,
+    requirement,
+    timeline,
+    lastFollowUpAt: null,
+    communications: [],
+    internalNotes: notes ? [{}] : []
+  });
+
   const customer = await Customer.create({
     crn: await generateCRN(),
     name,
     email: String(email).trim().toLowerCase(),
     phone: phone || null,
     companyName: normalizeCompanyName(companyName),
+    recordType: lifecycle.recordType,
+    leadStatus: lifecycle.leadStatus,
+    dealStage: lifecycle.dealStage,
     leadSource: leadSource || "",
     leadValue: Number(leadValue || 0),
     budget: Number(budget || 0),
+    requirement: String(requirement || "").trim(),
+    timeline: String(timeline || "").trim(),
     interestLevel: interestLevel || "warm",
-    probability: Number(probability ?? probabilityFromStage(normalizedPipelineStage)),
+    leadCategory: leadCategory || categoryFromScore(computedScore),
+    probability: Number(probability ?? probabilityFromStage(lifecycle.pipelineStage)),
     expectedCloseDate: expectedCloseDate ? new Date(expectedCloseDate) : null,
+    decisionMaker: String(decisionMaker || "").trim(),
     websiteId: resolvedWebsiteId,
-    status: normalizedStatus,
-    pipelineStage: normalizedPipelineStage,
+    status: lifecycle.status,
+    pipelineStage: lifecycle.pipelineStage,
     stageEnteredAt: new Date(),
     stageHistory: [{
       fromStage: "new",
-      toStage: normalizedPipelineStage,
+      toStage: normalizePipelineStage(lifecycle.pipelineStage),
       changedBy: req.user._id,
       changedAt: new Date(),
       reason: "lead_created"
@@ -445,12 +874,7 @@ export const createCustomer = asyncHandler(async (req, res) => {
     priority: priority || "medium",
     tags: Array.isArray(tags) ? tags : [],
     sourceDetails,
-    score: Math.min(100, Math.max(0,
-      (sessionId ? 10 : 0) +
-      (notes ? 10 : 0) +
-      (priority === "high" ? 15 : priority === "medium" ? 8 : 3) +
-      (interestLevel === "hot" ? 20 : interestLevel === "warm" ? 10 : 0)
-    )),
+    score: computedScore,
     internalNotes: notes && String(notes).trim() ? [{
       text: String(notes).trim(),
       authorName: req.user.name,
@@ -465,6 +889,13 @@ export const createCustomer = asyncHandler(async (req, res) => {
   });
 
   await incrementCustomers(resolvedWebsiteId);
+
+  // Phase 3 & 11: Automation on creation/assignment
+  if (resolvedOwnerId) {
+    await ensureFirstTouchTask(customer, resolvedOwnerId);
+  }
+  await sendCrmLifecycleEmail(customer, "welcome");
+
   if (resolvedOwnerId) {
     await createAndEmitCrmNotification({
       recipient: resolvedOwnerId,
@@ -484,6 +915,9 @@ export const createCustomer = asyncHandler(async (req, res) => {
       crn: customer.crn,
       ownerId: resolvedOwnerId || null,
       pipelineStage: customer.pipelineStage,
+      recordType: customer.recordType,
+      leadStatus: customer.leadStatus,
+      dealStage: customer.dealStage,
       priority: customer.priority,
       duplicateCandidates: duplicateCandidates.map((candidate) => ({
         _id: candidate._id,
@@ -531,6 +965,7 @@ export const createCustomer = asyncHandler(async (req, res) => {
       email: customer.email,
       pipelineStage: customer.pipelineStage,
       status: customer.status,
+      recordType: customer.recordType,
       ownerId: resolvedOwnerId || null,
       sessionId: sessionId || null
     },
@@ -572,6 +1007,9 @@ export const archiveCustomer = asyncHandler(async (req, res) => {
   }
 
   customer.status = "inactive";
+  customer.recordType = customer.recordType === "customer" ? "customer" : "deal";
+  customer.leadStatus = customer.leadStatus || "qualified";
+  customer.dealStage = "lost";
   customer.pipelineStage = "lost";
   customer.lastInteraction = new Date();
   customer.archivedAt = new Date();
@@ -600,6 +1038,172 @@ export const archiveCustomer = asyncHandler(async (req, res) => {
     .populate("ownerId", "name email role")
     .populate("websiteId", "websiteName domain");
   res.json(updated);
+});
+
+/**
+ * Post-win workflow: mark a CRM record as won, create onboarding tasks, draft a quotation,
+ * send lifecycle email/notification, record activity and audit event.
+ */
+export const postWin = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const id = req.params.id;
+  const customer = await Customer.findById(id);
+  if (!customer) throw new AppError("CRM record not found", 404);
+  if (!ownedWebsiteIds.map(String).includes(String(customer.websiteId))) {
+    throw new AppError("Unauthorized access to this website's CRM data", 403);
+  }
+
+  // Idempotent: if already won, return current state
+  if (String(customer.pipelineStage) === "won" || String(customer.status) === "won") {
+    return res.json(await buildCustomerPayload(customer._id));
+  }
+
+  const prevStage = customer.pipelineStage || "new";
+  customer.pipelineStage = "won";
+  customer.status = "won";
+  customer.dealStage = "won";
+  customer.recordType = "customer";
+  customer.probability = 100;
+  customer.stageEnteredAt = new Date();
+  if (!Array.isArray(customer.stageHistory)) customer.stageHistory = [];
+  customer.stageHistory.unshift({
+    fromStage: prevStage,
+    toStage: "won",
+    changedBy: req.user._id,
+    changedAt: new Date(),
+    reason: "deal_won"
+  });
+
+  await customer.save();
+
+  // Create a draft quotation
+  let quotation = null;
+  try {
+    quotation = await Quotation.create({
+      customerId: customer._id,
+      websiteId: customer.websiteId,
+      createdBy: req.user._id,
+      status: "draft",
+      items: [],
+      amount: Number(customer.leadValue || 0),
+      currency: "INR",
+      notes: "Auto-draft generated when deal marked won"
+    });
+  } catch (err) {
+    // non-fatal: continue even if quotation fails
+    console.error("Quotation create failed", err);
+  }
+
+  // Create onboarding follow-up tasks
+  const owner = customer.ownerId || req.user._id;
+  const onboardingTasks = [
+    { title: `Welcome email to ${customer.name}`, days: 0 },
+    { title: `Schedule onboarding call with ${customer.name}`, days: 1 },
+    { title: `Create customer account for ${customer.name}`, days: 2 },
+    { title: `Provision service / setup for ${customer.name}`, days: 3 }
+  ];
+
+  const createdTasks = [];
+  for (const t of onboardingTasks) {
+    try {
+      const dueAt = new Date();
+      dueAt.setDate(dueAt.getDate() + (t.days || 0));
+      const task = await FollowUpTask.create({
+        websiteId: customer.websiteId,
+        customerId: customer._id,
+        ownerId: owner,
+        title: t.title,
+        description: t.title,
+        priority: "high",
+        dueAt,
+        type: "onboarding"
+      });
+      createdTasks.push(task);
+    } catch (err) {
+      console.error("Failed to create onboarding task", err);
+    }
+  }
+
+  // Send lifecycle email to customer and notify owner
+  try {
+    await sendCrmLifecycleEmail(customer, "welcome");
+  } catch (err) {
+    console.error("sendCrmLifecycleEmail failed", err);
+  }
+
+  if (owner) {
+    await createAndEmitCrmNotification({
+      recipient: owner,
+      type: "crm_deal_won",
+      title: "Deal won",
+      message: `${customer.name} marked as won`,
+      link: `/crm/${customer._id}`
+    });
+  }
+
+  await emitCustomerActivity({
+    actor: req.user,
+    websiteId: customer.websiteId,
+    customerId: customer._id,
+    type: "deal_won",
+    summary: `Deal won for ${customer.name}`,
+    metadata: { prevStage }
+  });
+
+  await logAuditEvent({
+    actor: req.user,
+    action: "crm.deal_won",
+    entityType: "customer",
+    entityId: customer._id,
+    websiteId: customer.websiteId,
+    metadata: { prevStage, quotationId: quotation?._id || null },
+    ipAddress: req.ip
+  });
+
+  // update analytics snapshot if available
+  try {
+    await incrementCustomers(customer.websiteId);
+  } catch (err) {
+    console.error("incrementCustomers failed", err);
+  }
+  try {
+    // record revenue and conversion time for analytics
+    await addWonRevenue(customer.websiteId, customer.leadValue || 0);
+    const createdAt = customer.createdAt ? new Date(customer.createdAt) : new Date();
+    const conversionSeconds = Math.round((Date.now() - createdAt.getTime()) / 1000);
+    await recordConversionTime(customer.websiteId, conversionSeconds);
+  } catch (err) {
+    console.error("analytics post-win update failed", err);
+  }
+
+  const payload = await buildCustomerPayload(customer._id);
+  res.json({ customer: payload.customer, tasks: createdTasks, quotation });
+});
+
+/**
+ * Reports: aggregated CRM metrics for a website or range
+ */
+export const getCrmReports = asyncHandler(async (req, res) => {
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const { websiteId, startDate, endDate } = req.query;
+  const match = { websiteId: { $in: ownedWebsiteIds }, pipelineStage: "won" };
+  if (websiteId) {
+    if (!ownedWebsiteIds.map(String).includes(String(websiteId))) throw new AppError("Access denied", 403);
+    match.websiteId = websiteId;
+  }
+  const start = startDate ? new Date(startDate) : new Date(0);
+  const end = endDate ? new Date(endDate) : new Date();
+  match.updatedAt = { $gte: start, $lte: end };
+
+  const agg = await Customer.aggregate([
+    { $match: match },
+    { $project: { leadValue: 1, createdAt: 1, stageEnteredAt: 1 } },
+    { $group: { _id: null, totalRevenue: { $sum: "$leadValue" }, deals: { $sum: 1 }, avgConversionSeconds: { $avg: { $divide: [{ $subtract: ["$stageEnteredAt", "$createdAt"] }, 1000] } } } }
+  ]);
+
+  const row = agg[0] || { totalRevenue: 0, deals: 0, avgConversionSeconds: 0 };
+  res.json({ totalRevenue: row.totalRevenue || 0, deals: row.deals || 0, avgConversionSeconds: Math.round(row.avgConversionSeconds || 0) });
 });
 
 /**
@@ -684,6 +1288,9 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   const {
     status,
     pipelineStage,
+    recordType,
+    leadStatus,
+    dealStage,
     tags,
     name,
     phone,
@@ -691,11 +1298,15 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     leadSource,
     leadValue,
     budget,
+    requirement,
+    timeline,
     interestLevel,
+    leadCategory,
     probability,
     priority,
     lostReason,
     expectedCloseDate,
+    decisionMaker,
     ownerId,
     assignmentReason,
     nextFollowUpAt,
@@ -704,6 +1315,9 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   const customer = await Customer.findById(req.params.id);
   if (!customer) throw new AppError("Customer not found", 404);
   const previousState = {
+    recordType: customer.recordType,
+    leadStatus: customer.leadStatus,
+    dealStage: customer.dealStage,
     status: customer.status,
     pipelineStage: customer.pipelineStage,
     ownerId: customer.ownerId ? String(customer.ownerId) : null,
@@ -712,11 +1326,15 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     leadSource: customer.leadSource,
     leadValue: customer.leadValue,
     budget: customer.budget,
+    requirement: customer.requirement,
+    timeline: customer.timeline,
     interestLevel: customer.interestLevel,
+    leadCategory: customer.leadCategory,
     probability: customer.probability,
     priority: customer.priority,
     lostReason: customer.lostReason,
-    expectedCloseDate: customer.expectedCloseDate
+    expectedCloseDate: customer.expectedCloseDate,
+    decisionMaker: customer.decisionMaker
   };
 
   const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
@@ -726,12 +1344,13 @@ export const updateCustomer = asyncHandler(async (req, res) => {
 
   // Sales: enforce status transition limits
   if (req.user.role === "sales") {
-    if (status && status !== customer.status) {
-      const currentStatus = customer.status || "new";
+    const requestedStatus = dealStage || leadStatus || status;
+    if (requestedStatus && requestedStatus !== customer.status) {
+      const currentStatus = customer.dealStage || customer.leadStatus || customer.status || "new";
       const allowed = SALES_ALLOWED_STATUS_TRANSITIONS[currentStatus] || [currentStatus];
-      if (!allowed.includes(status)) {
+      if (!allowed.includes(requestedStatus)) {
         throw new AppError(
-          `Sales cannot change status from "${currentStatus}" to "${status}". Allowed transitions: ${allowed.join(", ")}`,
+          `Sales cannot change status from "${currentStatus}" to "${requestedStatus}". Allowed transitions: ${allowed.join(", ")}`,
           403
         );
       }
@@ -746,27 +1365,14 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     }
   }
 
-  if (status) customer.status = status;
-  if (pipelineStage) {
-    const nextStage = normalizePipelineStage(pipelineStage);
-    if (nextStage !== customer.pipelineStage) {
-      if (!customer.stageHistory) customer.stageHistory = [];
-      customer.stageHistory.unshift({
-        fromStage: customer.pipelineStage || "new",
-        toStage: nextStage,
-        changedBy: req.user._id,
-        changedAt: new Date(),
-        durationMs: customer.stageEnteredAt ? new Date() - new Date(customer.stageEnteredAt) : 0,
-        reason: assignmentReason || "manual_stage_update"
-      });
-      customer.pipelineStage = nextStage;
-      customer.stageEnteredAt = new Date();
-      customer.status = resolveStatusFromPipelineStage(nextStage);
-      if (probability === undefined) {
-        customer.probability = probabilityFromStage(nextStage);
-      }
-    }
-  }
+  const nextLifecycle = deriveLifecycleFields({
+    pipelineStage: pipelineStage || status || leadStatus || dealStage || customer.pipelineStage,
+    recordType: recordType || customer.recordType,
+    leadStatus: leadStatus || customer.leadStatus,
+    dealStage: dealStage || customer.dealStage
+  });
+  validateLifecycleTransition(previousState, nextLifecycle);
+
   if (tags) customer.tags = tags;
   if (name) customer.name = name;
   if (phone) customer.phone = phone;
@@ -774,6 +1380,8 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   if (leadSource !== undefined) customer.leadSource = leadSource || "";
   if (leadValue !== undefined) customer.leadValue = Number(leadValue || 0);
   if (budget !== undefined) customer.budget = Number(budget || 0);
+  if (requirement !== undefined) customer.requirement = String(requirement || "").trim();
+  if (timeline !== undefined) customer.timeline = String(timeline || "").trim();
   if (interestLevel !== undefined) customer.interestLevel = interestLevel || "warm";
   if (probability !== undefined) customer.probability = Number(probability || 0);
   if (priority !== undefined) customer.priority = priority || "medium";
@@ -781,6 +1389,7 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   if (expectedCloseDate !== undefined) {
     customer.expectedCloseDate = expectedCloseDate ? new Date(expectedCloseDate) : null;
   }
+  if (decisionMaker !== undefined) customer.decisionMaker = String(decisionMaker || "").trim();
   if (lastFollowUpAt !== undefined) {
     customer.lastFollowUpAt = lastFollowUpAt ? new Date(lastFollowUpAt) : null;
   }
@@ -803,6 +1412,10 @@ export const updateCustomer = asyncHandler(async (req, res) => {
       if (!isWebsiteScoped || !isSameTenant || !["sales", "manager"].includes(nextOwner.role)) {
         throw new AppError("Selected CRM owner is outside your assignment scope", 403);
       }
+
+      // Phase 3 & 11: Automation on reassignment
+      await ensureFirstTouchTask(customer, nextOwner._id);
+
       customer.ownerId = nextOwner._id;
       customer.ownerAssignedAt = new Date();
       if (!customer.assignmentHistory) customer.assignmentHistory = [];
@@ -834,6 +1447,43 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     }
   }
 
+  if (nextLifecycle.recordType !== customer.recordType || nextLifecycle.pipelineStage !== customer.pipelineStage) {
+    if (!customer.stageHistory) customer.stageHistory = [];
+    customer.stageHistory.unshift({
+      fromStage: normalizePipelineStage(customer.pipelineStage || "new"),
+      toStage: normalizePipelineStage(nextLifecycle.pipelineStage),
+      changedBy: req.user._id,
+      changedAt: new Date(),
+      durationMs: customer.stageEnteredAt ? new Date() - new Date(customer.stageEnteredAt) : 0,
+      reason: assignmentReason || "manual_stage_update"
+    });
+    customer.stageEnteredAt = new Date();
+  }
+
+  customer.recordType = nextLifecycle.recordType;
+  customer.leadStatus = nextLifecycle.leadStatus;
+  customer.dealStage = nextLifecycle.dealStage;
+  customer.pipelineStage = nextLifecycle.pipelineStage;
+  customer.status = nextLifecycle.status;
+
+  // Validation relaxed to allow fluid pipeline movement
+  if (customer.dealStage === "lost" && !customer.lostReason) {
+    throw new AppError("Lost deals require a lost reason", 400);
+  }
+  if (customer.recordType === "customer" && customer.pipelineStage !== "won") {
+    throw new AppError("Customers can only be created from won deals", 400);
+  }
+
+  if (leadCategory !== undefined) {
+    customer.leadCategory = leadCategory || "warm";
+  } else {
+    customer.score = computeLeadScore(customer);
+    customer.leadCategory = categoryFromScore(customer.score);
+  }
+  if (probability === undefined) {
+    customer.probability = probabilityFromStage(customer.pipelineStage);
+  }
+
   customer.lastActivity = new Date();
   customer.lastInteraction = new Date();
 
@@ -847,6 +1497,9 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     metadata: {
       before: previousState,
       after: {
+        recordType: customer.recordType,
+        leadStatus: customer.leadStatus,
+        dealStage: customer.dealStage,
         status: customer.status,
         pipelineStage: customer.pipelineStage,
         ownerId: customer.ownerId ? String(customer.ownerId) : null,
@@ -855,11 +1508,15 @@ export const updateCustomer = asyncHandler(async (req, res) => {
         leadSource: customer.leadSource,
         leadValue: customer.leadValue,
         budget: customer.budget,
+        requirement: customer.requirement,
+        timeline: customer.timeline,
         interestLevel: customer.interestLevel,
+        leadCategory: customer.leadCategory,
         probability: customer.probability,
         priority: customer.priority,
         lostReason: customer.lostReason,
-        expectedCloseDate: customer.expectedCloseDate
+        expectedCloseDate: customer.expectedCloseDate,
+        decisionMaker: customer.decisionMaker
       }
     }
   });
@@ -872,6 +1529,9 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     metadata: {
       before: previousState,
       after: {
+        recordType: customer.recordType,
+        leadStatus: customer.leadStatus,
+        dealStage: customer.dealStage,
         status: customer.status,
         pipelineStage: customer.pipelineStage,
         ownerId: customer.ownerId ? String(customer.ownerId) : null,
@@ -890,11 +1550,11 @@ export const updateCustomer = asyncHandler(async (req, res) => {
  */
 export const addCustomerNote = asyncHandler(async (req, res) => {
   requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
-  
+
   // Support both legacy "text" and unified "content"/"type" payload formats
   const { text, content, type = "note" } = req.body;
   const noteText = content || text;
-  
+
   if (!noteText) throw new AppError("Note text or interaction content is required", 400);
 
   const customer = await Customer.findById(req.params.id);
@@ -1421,12 +2081,12 @@ export const getMyFollowUpTasks = asyncHandler(async (req, res) => {
  * List all internal notes from leads owned by the current user.
  */
 export const getMyCustomerNotes = asyncHandler(async (req, res) => {
-  const customers = await Customer.find({ 
-    ownerId: req.user._id, 
-    "internalNotes.0": { $exists: true } 
+  const customers = await Customer.find({
+    ownerId: req.user._id,
+    "internalNotes.0": { $exists: true }
   }).select("name email internalNotes crn");
 
-  const allNotes = customers.flatMap(c => 
+  const allNotes = customers.flatMap(c =>
     c.internalNotes.map(n => ({
       ...n.toObject(),
       customerName: c.name,
@@ -1437,4 +2097,369 @@ export const getMyCustomerNotes = asyncHandler(async (req, res) => {
   ).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
   res.json(allNotes);
+});
+
+/**
+ * Creates a new digital quotation for a customer.
+ */
+export const createQuotation = asyncHandler(async (req, res) => {
+  const { customerId, websiteId, items, subtotal, tax, total, currency, notes, terms, validUntil } = req.body;
+
+  if (!customerId || !websiteId || !items || !total) {
+    throw new AppError("Missing required quotation fields.", 400);
+  }
+
+  const isManager = ["admin", "client", "manager"].includes(req.user.role);
+  const requiresApproval = total > 50000 && !isManager;
+  const status = requiresApproval ? "pending_approval" : "sent";
+
+  const quotationId = `QT-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+
+  const quotation = await Quotation.create({
+    quotationId,
+    customerId,
+    websiteId,
+    ownerId: req.user._id,
+    items,
+    subtotal,
+    tax,
+    total,
+    currency: currency || "INR",
+    notes,
+    terms,
+    validUntil: validUntil || new Date(Date.now() + 15 * 24 * 60 * 60 * 1000), // Default 15 days
+    status,
+    tracking: [{ event: status, occuredAt: new Date(), ip: req.ip }]
+  });
+
+  if (requiresApproval) {
+    // Notify manager if available
+    const managerRecipient = req.user.managerId || null;
+    if (managerRecipient) {
+      await createAndEmitCrmNotification({
+        recipient: managerRecipient,
+        type: "crm_approval_required",
+        title: "Deal Approval Required",
+        message: `A high-value quotation (${formatCurrency(total)}) requires your authorization.`,
+        link: `/client?tab=crm&leadId=${customerId}`
+      });
+    }
+  }
+
+  await createActivityEvent({
+    actor: req.user,
+    websiteId,
+    entityType: "customer",
+    entityId: customerId,
+    type: "quote_sent",
+    summary: `Digital quotation ${quotationId} for ${total} sent to customer.`,
+    metadata: { quotationId, total }
+  });
+
+  res.status(201).json(quotation);
+});
+
+/**
+ * Create a Stripe PaymentIntent for a quotation
+ */
+export const createQuotationPayment = asyncHandler(async (req, res) => {
+  const stripeKey = env.stripeSecretKey;
+  if (!stripeKey) throw new AppError("Stripe not configured", 500);
+  const Stripe = (await import('stripe')).default;
+  const stripe = new Stripe(stripeKey);
+
+  const { id } = req.params;
+  const quotation = await Quotation.findById(id);
+  if (!quotation) throw new AppError("Quotation not found", 404);
+
+  const amount = Math.round(Number(quotation.total || 0) * 100); // INR -> paise
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount,
+    currency: (quotation.currency || 'INR').toLowerCase(),
+    metadata: { quotationId: quotation.quotationId, quotationDbId: String(quotation._id) }
+  });
+
+  res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+});
+
+/**
+ * List all quotations for a specific customer.
+ */
+export const getCustomerQuotations = asyncHandler(async (req, res) => {
+  const { customerId } = req.params;
+  const quotes = await Quotation.find({ customerId }).sort({ createdAt: -1 });
+  res.json(quotes);
+});
+
+/**
+ * Update the status of a quotation (e.g., accepted, rejected).
+ */
+export const updateQuotationStatus = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { status, reason } = req.body;
+
+  const quotation = await Quotation.findById(id);
+  if (!quotation) throw new AppError("Quotation not found.", 404);
+
+  quotation.status = status;
+  quotation.tracking.push({ event: status, occuredAt: new Date(), ip: req.ip, device: req.headers["user-agent"] });
+  await quotation.save();
+
+  // If accepted, we might want to automatically move deal stage
+  if (status === "accepted") {
+    const customer = await Customer.findById(quotation.customerId);
+    if (customer && customer.pipelineStage !== "won") {
+      customer.pipelineStage = "won";
+      customer.dealStage = "won";
+      customer.status = "customer";
+      customer.recordType = "customer";
+      await customer.save();
+
+      await createActivityEvent({
+        actor: req.user,
+        websiteId: customer.websiteId,
+        entityType: "customer",
+        entityId: customer._id,
+        type: "stage_changed",
+        summary: `Deal automatically won via quotation acceptance.`,
+        metadata: { fromStage: "proposal", toStage: "won" }
+      });
+    }
+  }
+
+  res.json(quotation);
+});
+
+/**
+ * Send a draft quotation (change status -> sent, push tracking, generate PDF placeholder)
+ */
+export const sendQuotation = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const quotation = await Quotation.findById(id);
+  if (!quotation) throw new AppError("Quotation not found.", 404);
+
+  // Only owner or manager can send
+  if (String(quotation.ownerId) !== String(req.user._id) && !["admin", "client", "manager"].includes(req.user.role)) {
+    throw new AppError("Unauthorized to send this quotation", 403);
+  }
+
+  quotation.status = "sent";
+  quotation.tracking.push({ event: "sent", occuredAt: new Date(), ip: req.ip, device: req.headers["user-agent"] });
+  // placeholder pdf url - in future generate actual PDF
+  quotation.pdfUrl = quotation.pdfUrl || `/uploads/quotations/${quotation.quotationId}.pdf`;
+  await quotation.save();
+
+  // Generate PDF file for the quotation (best-effort)
+  try {
+    const pdfResult = await generateQuotationPDF(quotation);
+    if (pdfResult && pdfResult.path) {
+      quotation.pdfUrl = pdfResult.path;
+      await quotation.save();
+    }
+  } catch (err) {
+    console.error("Failed to generate quotation PDF:", err);
+  }
+
+  await createAndEmitCrmNotification({
+    recipient: quotation.ownerId,
+    type: "crm_quote_sent",
+    title: "Quotation Sent",
+    message: `Quotation ${quotation.quotationId} has been sent to the customer.`,
+    link: `/sales?leadId=${quotation.customerId}`
+  });
+
+  await createActivityEvent({
+    actor: req.user,
+    websiteId: quotation.websiteId,
+    entityType: "quotation",
+    entityId: quotation._id,
+    type: "quote_sent",
+    summary: `Quotation ${quotation.quotationId} sent to customer`,
+    metadata: { quotationId: quotation.quotationId }
+  });
+
+  res.json(quotation);
+});
+
+/**
+ * Approve a pending quotation (Manager only).
+ */
+export const approveQuotation = asyncHandler(async (req, res) => {
+  requireRole("admin", "client", "manager");
+  const quotation = await Quotation.findById(req.params.id);
+  if (!quotation) throw new AppError("Quotation not found.", 404);
+
+  quotation.status = "sent";
+  quotation.tracking.push({ event: "sent", occuredAt: new Date(), ip: req.ip });
+  await quotation.save();
+
+  await createAndEmitCrmNotification({
+    recipient: quotation.ownerId,
+    type: "crm_quote_approved",
+    title: "Quotation Approved",
+    message: `Your quotation ${quotation.quotationId} has been authorized and sent to the customer.`,
+    link: `/sales?leadId=${quotation.customerId}`
+  });
+
+  res.json(quotation);
+});
+
+/**
+ * Deny a pending quotation (Manager only).
+ */
+export const denyQuotation = asyncHandler(async (req, res) => {
+  requireRole("admin", "client", "manager");
+  const quotation = await Quotation.findById(req.params.id);
+  if (!quotation) throw new AppError("Quotation not found.", 404);
+
+  quotation.status = "denied";
+  quotation.tracking.push({ event: "denied", occuredAt: new Date(), ip: req.ip });
+  await quotation.save();
+
+  await createAndEmitCrmNotification({
+    recipient: quotation.ownerId,
+    type: "crm_quote_denied",
+    title: "Quotation Denied",
+    message: `Your quotation ${quotation.quotationId} was rejected by management. Review comments in notes.`,
+    link: `/sales?leadId=${quotation.customerId}`
+  });
+
+  res.json(quotation);
+});
+
+/**
+ * Bulk updates multiple customer records (e.g., owner, status, stage).
+ */
+export const bulkUpdateCustomers = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
+  const { ids, updates } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) throw new AppError("No customer IDs provided.", 400);
+
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const stringOwnedIds = ownedWebsiteIds.map(id => id.toString());
+
+  const results = { updated: 0, failed: 0 };
+  const sanitizedUpdates = { ...updates };
+
+  // Guard core fields
+  delete sanitizedUpdates.email;
+  delete sanitizedUpdates.crn;
+  delete sanitizedUpdates._id;
+  delete sanitizedUpdates.websiteId;
+
+  for (const id of ids) {
+    try {
+      const customer = await Customer.findById(id);
+      if (!customer || !stringOwnedIds.includes(customer.websiteId.toString())) {
+        results.failed++;
+        continue;
+      }
+
+      Object.assign(customer, sanitizedUpdates);
+      await customer.save();
+
+      await logAuditEvent({
+        actor: req.user,
+        action: "crm.bulk_update",
+        entityType: "customer",
+        entityId: customer._id,
+        websiteId: customer.websiteId,
+        metadata: { updates: sanitizedUpdates },
+        ipAddress: req.ip
+      });
+
+      results.updated++;
+    } catch (err) {
+      console.error(`Bulk update failed for ${id}:`, err);
+      results.failed++;
+    }
+  }
+
+  res.json({ message: "Bulk update complete", results });
+});
+
+/**
+ * Bulk deletes multiple customer records permanently.
+ */
+export const bulkDeleteCustomers = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_DELETE);
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) throw new AppError("No customer IDs provided.", 400);
+
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const stringOwnedIds = ownedWebsiteIds.map(id => id.toString());
+
+  const results = { deleted: 0, failed: 0 };
+
+  for (const id of ids) {
+    try {
+      const customer = await Customer.findById(id);
+      if (!customer || !stringOwnedIds.includes(customer.websiteId.toString())) {
+        results.failed++;
+        continue;
+      }
+
+      await Customer.deleteOne({ _id: id });
+
+      await logAuditEvent({
+        actor: req.user,
+        action: "crm.bulk_delete",
+        entityType: "customer",
+        entityId: id,
+        websiteId: customer.websiteId,
+        metadata: { name: customer.name, crn: customer.crn },
+        ipAddress: req.ip
+      });
+
+      results.deleted++;
+    } catch (err) {
+      console.error(`Bulk delete failed for ${id}:`, err);
+      results.failed++;
+    }
+  }
+
+  res.json({ message: "Bulk delete complete", results });
+});
+
+export const promoteVisitor = asyncHandler(async (req, res) => {
+  const { visitorId, sessionId, leadSource = "Live Chat" } = req.body;
+
+  const visitor = await Visitor.findOne({ visitorId, websiteId: req.ownedWebsiteIds });
+  if (!visitor) throw new AppError("Visitor record not found", 404);
+
+  const customer = await getOrCreateCustomer({
+    name: visitor.name || "Anonymous Chat Lead",
+    email: visitor.email,
+    websiteId: visitor.websiteId,
+    visitorId: visitor.visitorId,
+    leadSource,
+    ownerId: req.user._id // Assign to the agent who clicked 'Promote'
+  });
+
+  if (!customer) throw new AppError("Failed to create customer record", 500);
+
+  // Mark visitor with customer pointer
+  visitor.customerId = customer._id;
+  visitor.crn = customer.crn;
+  await visitor.save();
+
+  // If session provided, link it too
+  if (sessionId) {
+    await ChatSession.findOneAndUpdate(
+      { sessionId, websiteId: visitor.websiteId },
+      { customerId: customer._id, crn: customer.crn }
+    );
+  }
+
+  // Audit
+  await createActivityEvent({
+    entityId: customer._id,
+    entityType: "customer",
+    action: "promoted",
+    description: `Manually promoted from chat session ${sessionId || visitorId}`,
+    performedBy: req.user._id,
+    websiteId: visitor.websiteId
+  });
+
+  res.json(customer);
 });

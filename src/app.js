@@ -82,7 +82,7 @@ export function createApp() {
   }
 
   const authLimiter = rateLimit({
-    max: 15,
+    max: 5,
     windowMs: 15 * 60 * 1000,
     message: { status: "error", message: "Too many login attempts. Please try again in 15 minutes." },
     standardHeaders: true,

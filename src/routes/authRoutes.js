@@ -3,6 +3,7 @@ import {
   disableTwoFactor,
   login,
   me,
+  refresh,
   register,
   setupTwoFactor,
   verifyTwoFactorSetup
@@ -14,6 +15,7 @@ const router = Router();
 
 router.post("/register", register);
 router.post("/login", login);
+router.post("/refresh", requireAuth, refresh);
 router.get("/me", requireAuth, me);
 router.post("/agents/register", requireAuth, requireRole("admin", "client"), register);
 router.post("/2fa/setup", requireAuth, setupTwoFactor);

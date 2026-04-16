@@ -1,3 +1,4 @@
+import { logger } from "../utils/logger.js";
 import { Customer } from "../models/Customer.js";
 import { incrementCustomers } from "./analyticsService.js";
 import { User } from "../models/User.js";
@@ -9,7 +10,7 @@ import { User } from "../models/User.js";
 export const generateCRN = async () => {
   const year = new Date().getFullYear();
   const prefix = `CRN-${year}-`;
-  
+
   // Find the last CRN for the current year
   const lastCustomer = await Customer.findOne({ crn: new RegExp(`^${prefix}`) })
     .sort({ crn: -1 })
@@ -56,11 +57,13 @@ export const getOrCreateCustomer = async (data) => {
       name: name || "Anonymous Visitor",
       email: resolvedEmail,
       phone: phone || null,
-      websiteId
+      websiteId,
+      leadSource: data.leadSource || "Manual",
+      ownerId: data.ownerId || null
     });
     await customer.save();
     await incrementCustomers(websiteId);
-    console.log(`[CRN_SYSTEM]: Created customer ${crn} for ${name || "anonymous visitor"}`);
+    logger.log(`[CRN_SYSTEM]: Created customer ${crn} for ${name || "anonymous visitor"}`);
   } else {
     // Update last interaction and fill missing identity details
     customer.lastInteraction = new Date();

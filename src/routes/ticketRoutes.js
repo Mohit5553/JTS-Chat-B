@@ -3,7 +3,8 @@ import {
   getTickets, createTicketFromChat, updateTicket,
   submitVisitorTicket, getTicketByPublicId,
   getVisitorHistory, getCustomerHistoryByCRN,
-  bulkUpdateTickets, exportTickets, getTicketActivity
+  bulkUpdateTickets, exportTickets, getTicketActivity,
+  deleteTicket, bulkDeleteTickets
 } from "../controllers/ticketController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
@@ -32,6 +33,8 @@ router.get("/", requireRole("admin", "client", "manager", "agent", "sales"), get
 router.get("/:id/activity", requireRole("admin", "client", "manager", "agent", "sales"), getTicketActivity);
 router.post("/convert", requireRole("admin", "client", "manager", "agent", "sales"), validate(createTicketFromChatSchema), createTicketFromChat);
 router.post("/bulk-update", requireRole("admin", "client", "manager", "agent"), validate(bulkUpdateTicketsSchema), bulkUpdateTickets);
+router.post("/bulk-delete", requireRole("admin", "client", "manager"), bulkDeleteTickets);
 router.patch("/:id", requireRole("admin", "client", "manager", "agent", "sales"), validate(updateTicketSchema), updateTicket);
+router.delete("/:id", requireRole("admin", "client", "manager"), deleteTicket);
 
 export default router;

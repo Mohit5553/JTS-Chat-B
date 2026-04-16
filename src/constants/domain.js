@@ -9,14 +9,28 @@ export const ROLES = Object.freeze({
 
 export const ROLE_VALUES = Object.freeze(Object.values(ROLES));
 
-// Updated CRM statuses to match new Lead Status field
+export const CRM_RECORD_TYPES = Object.freeze(["lead", "deal", "customer"]);
+export const CRM_LEAD_STATUSES = Object.freeze(["new", "contacted", "qualified", "disqualified"]);
+export const CRM_DEAL_STAGES = Object.freeze(["qualified", "proposal", "negotiation", "won", "lost"]);
+export const CRM_LEAD_TEMPERATURES = Object.freeze(["cold", "warm", "hot"]);
+export const CRM_LOST_REASONS = Object.freeze(["price_issue", "competitor", "no_response", "not_interested"]);
+
+// Legacy compatibility enums retained for older code paths and stored historic data.
 export const CRM_STATUSES = Object.freeze([
-  "new", "contacted", "qualified", "proposal_sent", "negotiation", "won", "lost",
-  // legacy values kept for backwards compatibility
-  "prospect", "lead", "customer", "inactive"
+  ...CRM_LEAD_STATUSES,
+  ...CRM_DEAL_STAGES,
+  "prospect", "lead", "customer", "inactive", "hold", "proposal_sent", "proposition"
 ]);
 
-export const CRM_PIPELINE_STAGES = Object.freeze(["new", "contacted", "qualified", "proposal_sent", "negotiation", "won", "lost"]);
+export const CRM_PIPELINE_STAGES = Object.freeze([
+  "new",
+  "contacted",
+  "qualified",
+  "proposal",
+  "negotiation",
+  "won",
+  "lost"
+]);
 export const TICKET_STATUSES = Object.freeze(["open", "in_progress", "waiting", "resolved", "closed", "pending", "archived"]);
 export const TICKET_PRIORITIES = Object.freeze(["low", "medium", "high", "urgent"]);
 export const TICKET_CRM_STAGES = Object.freeze(["none", "lead", "qualified", "opportunity", "proposal", "negotiation", "won", "lost"]);
@@ -29,9 +43,10 @@ export const CHAT_STATUSES = Object.freeze(["active", "closed", "queued", "archi
 export const SALES_ALLOWED_STATUS_TRANSITIONS = Object.freeze({
   new: ["new", "contacted"],
   contacted: ["contacted", "qualified"],
-  qualified: ["qualified", "proposal_sent"],
-  proposal_sent: ["proposal_sent", "negotiation"],
+  qualified: ["qualified", "proposal"],
+  proposal: ["proposal", "negotiation"],
   negotiation: ["negotiation"],
+  disqualified: ["disqualified"],
   // legacy statuses
   prospect: ["prospect", "lead"],
   lead: ["lead", "customer"],

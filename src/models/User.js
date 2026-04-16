@@ -55,7 +55,11 @@ const userSchema = new mongoose.Schema(
     subscription: { type: subscriptionSchema, default: () => ({}) },
     // Stripe Integration
     stripeCustomerId: { type: String, default: null },
-    stripeSubscriptionId: { type: String, default: null }
+    stripeSubscriptionId: { type: String, default: null },
+    // Advanced CRM Tier-2 Fields
+    specialties: { type: [String], default: [] }, // e.g., ["technical", "medical", "legal"]
+    territories: { type: [String], default: [] }, // e.g., ["india", "usa", "emea"]
+    monthlyTarget: { type: Number, default: 0 }
   },
   { timestamps: true }
 );

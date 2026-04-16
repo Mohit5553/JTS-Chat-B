@@ -68,17 +68,19 @@ function normalizeError(err) {
     err.isOperational = true;
   }
 
-  // JWT errors → 401
-  if (err.name === "JsonWebTokenError") {
-    err.statusCode = 401;
+  // Multer file size limit error → 413
+  if (err.code === "LIMIT_FILE_SIZE") {
+    err.statusCode = 413;
     err.status = "fail";
-    err.message = "Invalid token. Please log in again.";
+    err.message = "File too large. Maximum size allowed is 10MB.";
     err.isOperational = true;
   }
-  if (err.name === "TokenExpiredError") {
-    err.statusCode = 401;
+
+  // Multer file type error → 400
+  if (err.message && err.message.includes("Unsupported file type")) {
+    err.statusCode = 400;
     err.status = "fail";
-    err.message = "Your session has expired. Please log in again.";
+    err.message = err.message;
     err.isOperational = true;
   }
 

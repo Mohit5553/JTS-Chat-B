@@ -1,6 +1,18 @@
 import { z } from "zod";
 import AppError from "./AppError.js";
-import { CRM_PIPELINE_STAGES, CRM_STATUSES, FOLLOW_UP_TASK_STATUSES, FOLLOW_UP_TASK_TYPES, TICKET_CRM_STAGES, TICKET_PRIORITIES, TICKET_STATUSES } from "../constants/domain.js";
+import {
+  CRM_DEAL_STAGES,
+  CRM_LEAD_STATUSES,
+  CRM_LOST_REASONS,
+  CRM_PIPELINE_STAGES,
+  CRM_RECORD_TYPES,
+  CRM_STATUSES,
+  FOLLOW_UP_TASK_STATUSES,
+  FOLLOW_UP_TASK_TYPES,
+  TICKET_CRM_STAGES,
+  TICKET_PRIORITIES,
+  TICKET_STATUSES
+} from "../constants/domain.js";
 
 /** Run a Zod schema against req.body; throws AppError on failure */
 export function validate(schema) {
@@ -73,6 +85,9 @@ export const bulkUpdateTicketsSchema = z.object({
 export const updateCustomerSchema = z.object({
   status: z.enum(CRM_STATUSES).optional(),
   pipelineStage: z.enum(CRM_PIPELINE_STAGES).optional(),
+  recordType: z.enum(CRM_RECORD_TYPES).optional(),
+  leadStatus: z.enum(CRM_LEAD_STATUSES).optional(),
+  dealStage: z.enum(CRM_DEAL_STAGES).nullable().optional(),
   tags: z.array(z.string().trim().min(1)).max(20).optional(),
   name: z.string().min(1).max(120).optional(),
   phone: z.string().max(40).optional(),
@@ -80,11 +95,15 @@ export const updateCustomerSchema = z.object({
   leadSource: z.string().max(120).optional(),
   leadValue: z.number().min(0).optional(),
   budget: z.number().min(0).optional(),
+  requirement: z.string().max(500).optional(),
+  timeline: z.string().max(120).optional(),
   interestLevel: z.enum(["cold", "warm", "hot"]).optional(),
+  leadCategory: z.enum(["cold", "warm", "hot"]).optional(),
   probability: z.number().min(0).max(100).optional(),
   priority: z.enum(["low", "medium", "high"]).optional(),
-  lostReason: z.string().max(200).optional(),
+  lostReason: z.enum(CRM_LOST_REASONS).optional().or(z.literal("")).or(z.literal("other")),
   expectedCloseDate: z.union([z.string().max(40), z.null()]).optional(),
+  decisionMaker: z.string().max(120).optional(),
   ownerId: z.string().nullable().optional(),
   assignmentReason: z.string().max(200).optional(),
   nextFollowUpAt: z.union([z.string().max(40), z.null()]).optional(),
@@ -97,13 +116,20 @@ export const createCustomerSchema = z.object({
   email: z.string().trim().email(),
   phone: z.string().trim().max(40).optional().or(z.literal("")),
   companyName: z.string().trim().max(120).optional().or(z.literal("")),
-  leadSource: z.string().trim().max(120).optional().or(z.literal("")),
+  recordType: z.enum(CRM_RECORD_TYPES).optional().default("lead"),
+  leadStatus: z.enum(CRM_LEAD_STATUSES).optional().default("new"),
+  dealStage: z.enum(CRM_DEAL_STAGES).nullable().optional(),
+  leadSource: z.string().trim().min(1, "Source is required").max(120),
   leadValue: z.number().min(0).optional().default(0),
-  budget: z.number().min(0).optional().default(0),
+  budget: z.number().min(0, "Budget is required"),
+  requirement: z.string().trim().min(1, "Requirement is required").max(500),
+  timeline: z.string().trim().min(1, "Timeline is required").max(120),
   interestLevel: z.enum(["cold", "warm", "hot"]).optional().default("warm"),
+  leadCategory: z.enum(["cold", "warm", "hot"]).optional(),
   probability: z.number().min(0).max(100).optional(),
   priority: z.enum(["low", "medium", "high"]).optional().default("medium"),
   expectedCloseDate: z.string().max(40).optional().or(z.literal("")),
+  decisionMaker: z.string().trim().max(120).optional().or(z.literal("")),
   websiteId: z.string().min(1, "Website is required"),
   status: z.enum(CRM_STATUSES).default("new"),
   pipelineStage: z.enum(CRM_PIPELINE_STAGES).default("new"),

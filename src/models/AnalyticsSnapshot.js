@@ -10,6 +10,9 @@ const analyticsSnapshotSchema = new mongoose.Schema(
     resolvedChats: { type: Number, default: 0 },
     avgWaitTimeSeconds: { type: Number, default: 0 },
     avgHandleTimeSeconds: { type: Number, default: 0 }
+    , totalRevenue: { type: Number, default: 0 },
+    conversions: { type: Number, default: 0 },
+    avgConversionTimeSeconds: { type: Number, default: 0 }
   },
   { timestamps: true }
 );

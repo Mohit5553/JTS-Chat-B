@@ -3,7 +3,8 @@ import {
   uploadAttachment, acceptChatSession, closeChatSession,
   getSessionMessages, listAgentSessions, listManagerSessions, listSalesSessions,
   listQueuedSessions, getChatHistory, transferChatSession,
-  addInternalNote, getInternalNotes, getSessionActivity
+  addInternalNote, getInternalNotes, getSessionActivity,
+  bulkCloseSessions, bulkReassignSessions, bulkDeleteSessions, deleteChatSession
 } from "../controllers/chatController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { upload } from "../utils/multerConfig.js";
@@ -25,6 +26,12 @@ router.get("/sessions/:sessionId/messages", requireAuth, getSessionMessages);
 router.get("/sessions/:sessionId/activity", requireAuth, getSessionActivity);
 router.patch("/sessions/:sessionId/accept", requireAuth, requireRole("admin", "client", "agent", "sales", "user"), acceptChatSession);
 router.patch("/sessions/:sessionId/close", requireAuth, closeChatSession);
+router.delete("/sessions/:sessionId", requireAuth, requireRole("admin", "client", "manager"), deleteChatSession);
+
+// Bulk Operations
+router.post("/bulk-close", requireAuth, requireRole("admin", "client", "manager"), bulkCloseSessions);
+router.post("/bulk-reassign", requireAuth, requireRole("admin", "client", "manager"), bulkReassignSessions);
+router.post("/bulk-delete", requireAuth, requireRole("admin", "client", "manager"), bulkDeleteSessions);
 
 // Feature 5: Chat Transfer
 router.post("/sessions/:sessionId/transfer", requireAuth, requireRole("admin", "client", "agent"), transferChatSession);

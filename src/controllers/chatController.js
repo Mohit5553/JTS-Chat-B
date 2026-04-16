@@ -57,19 +57,46 @@ async function ensureSessionStaffAccess(session, user) {
 }
 
 async function populateMessageNames(messages) {
-  const result = [];
-  for (const m of messages) {
+  if (!messages || messages.length === 0) return [];
+
+  // Batch-load all agent IDs at once instead of N+1 queries
+  const agentIds = [...new Set(
+    messages
+      .filter(m => m.sender === "agent" && m.agentId)
+      .map(m => m.agentId.toString())
+  )];
+  const agentMap = {};
+  if (agentIds.length > 0) {
+    const agents = await User.find({ _id: { $in: agentIds } }).select("name");
+    agents.forEach(a => { agentMap[a._id.toString()] = a.name; });
+  }
+
+  // For visitor sender name, get the session once
+  let visitorSessionMap = {};
+  const sessionIds = [...new Set(
+    messages
+      .filter(m => m.sender === "visitor")
+      .map(m => m.sessionId?.toString())
+      .filter(Boolean)
+  )];
+  if (sessionIds.length > 0) {
+    const sessions = await ChatSession.find({ _id: { $in: sessionIds } })
+      .populate("visitorId", "name")
+      .select("_id visitorId");
+    sessions.forEach(s => {
+      visitorSessionMap[s._id.toString()] = s.visitorId?.name || "You";
+    });
+  }
+
+  return messages.map(m => {
     const plain = m.toObject();
     if (plain.sender === "agent" && plain.agentId) {
-      const agent = await User.findById(plain.agentId).select("name");
-      plain.senderName = agent?.name || "Support";
+      plain.senderName = agentMap[plain.agentId.toString()] || "Support";
     } else if (plain.sender === "visitor") {
-      const session = await ChatSession.findById(plain.sessionId).populate("visitorId");
-      plain.senderName = session?.visitorId?.name || "You";
+      plain.senderName = visitorSessionMap[plain.sessionId?.toString()] || "You";
     }
-    result.push(plain);
-  }
-  return result;
+    return plain;
+  });
 }
 
 export async function uploadAttachment(req, res) {
@@ -306,6 +333,7 @@ export async function submitSessionFeedback(req, res) {
   }
 
   session.satisfactionStatus = satisfactionStatus;
+  await session.save();
   return res.json({ success: true, satisfactionStatus: session.satisfactionStatus });
 }
 
@@ -320,7 +348,7 @@ export async function submitBotStatus(req, res) {
     session.status = "closed";
     session.closedAt = new Date();
   }
-  
+
   if (path) session.botMetadata.path = path;
   if (selections) session.botMetadata.selections = selections;
 
@@ -333,13 +361,18 @@ export async function submitBotStatus(req, res) {
 export async function getWidgetConfig(req, res) {
   const website = req.website;
 
+  // Check if ANY agent assigned to this website is currently online
+  const managerId = website.managerId;
   const agents = await User.find({
     role: "agent",
-    managerId: website.managerId
-  }).sort({ lastActiveAt: -1 }).limit(1);
+    managerId
+  }).select("isOnline lastActiveAt").lean();
 
-  const lastActiveAt = agents.length > 0 ? agents[0].lastActiveAt : null;
-  const isAgentOnline = agents.length > 0 && agents[0].isOnline;
+  const isAgentOnline = agents.some(a => a.isOnline === true);
+  const lastActiveAgent = agents
+    .filter(a => a.lastActiveAt)
+    .sort((a, b) => new Date(b.lastActiveAt) - new Date(a.lastActiveAt))[0];
+  const lastActiveAt = lastActiveAgent?.lastActiveAt || null;
 
   // Feature 7: Business hours check
   const businessOpen = isBusinessOpen(website.businessHours);
@@ -352,7 +385,7 @@ export async function getWidgetConfig(req, res) {
     launcherIcon: website.launcherIcon,
     welcomeMessage: website.welcomeMessage,
     awayMessage: website.awayMessage,
-    isAgentOnline: !!isAgentOnline,
+    isAgentOnline,
     isBusinessOpen: businessOpen,
     showOfflineForm: !businessOpen || !isAgentOnline,
     lastActiveAt,
@@ -399,12 +432,13 @@ export async function getChatHistory(req, res) {
       const matchingVisitors = await Visitor.find({
         $or: [{ name: searchRegex }, { email: searchRegex }, { visitorId: searchRegex }]
       }).select("_id");
-      const matchingMessages = await Message.find({ message: searchRegex }).select("sessionId").distinct("sessionId");
+      // distinct("sessionId") already returns the session ObjectId references
+      const matchingSessionIds = await Message.find({ message: searchRegex }).distinct("sessionId");
       const visitorIds = matchingVisitors.map(v => v._id);
       filter.$or = [
         { lastMessagePreview: searchRegex },
         { visitorId: { $in: visitorIds } },
-        { _id: { $in: matchingMessages } }
+        { _id: { $in: matchingSessionIds } }   // now correctly session ObjectIds, not message ids
       ];
     }
 
@@ -602,6 +636,146 @@ export async function getSessionActivity(req, res) {
   }
 }
 
+export async function bulkCloseSessions(req, res) {
+  try {
+    const { sessionIds } = req.body;
+    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return res.status(400).json({ message: "sessionIds array is required" });
+    }
+
+    const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+    const sessions = await ChatSession.find({ sessionId: { $in: sessionIds }, websiteId: { $in: ownedWebsiteIds } });
+
+    for (const session of sessions) {
+      if (session.status !== "closed") {
+        await closeSession(session._id);
+        await logAuditEvent({
+          actor: req.user,
+          action: "chat.bulk_closed",
+          entityType: "chat_session",
+          entityId: session._id,
+          websiteId: session.websiteId,
+          metadata: { sessionId: session.sessionId },
+          ipAddress: req.ip
+        });
+        emitSessionUpdate(await loadRealtimeSession(session._id));
+      }
+    }
+
+    res.json({ message: "Bulk close completed", count: sessions.length });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
+export async function bulkReassignSessions(req, res) {
+  try {
+    const { sessionIds, toAgentId } = req.body;
+    if (!sessionIds || !toAgentId) return res.status(400).json({ message: "sessionIds and toAgentId are required" });
+
+    const role = normalizeRole(req.user.role);
+    if (!["admin", "client", "manager"].includes(role)) {
+      return res.status(403).json({ message: "Only managers can reassign sessions in bulk" });
+    }
+
+    const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+    const [sessions, toAgent] = await Promise.all([
+      ChatSession.find({ sessionId: { $in: sessionIds }, websiteId: { $in: ownedWebsiteIds } }),
+      User.findById(toAgentId)
+    ]);
+
+    if (!toAgent) return res.status(404).json({ message: "Target agent not found" });
+
+    for (const session of sessions) {
+      session.assignedAgent = toAgent._id;
+      session.status = "active";
+      if (!session.transferHistory) session.transferHistory = [];
+      session.transferHistory.unshift({
+        fromAgentId: req.user._id,
+        toAgentId: toAgent._id,
+        reason: "bulk_reassignment",
+        transferredAt: new Date()
+      });
+      await session.save();
+
+      await logAuditEvent({
+        actor: req.user,
+        action: "chat.bulk_reassigned",
+        entityType: "chat_session",
+        entityId: session._id,
+        websiteId: session.websiteId,
+        metadata: { sessionId: session.sessionId, toAgentId: toAgent._id },
+        ipAddress: req.ip
+      });
+      emitSessionUpdate(await loadRealtimeSession(session._id));
+    }
+
+    res.json({ message: "Bulk reassignment completed", count: sessions.length });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
+export async function bulkDeleteSessions(req, res) {
+  try {
+    const role = normalizeRole(req.user.role);
+    if (!["admin", "client", "manager"].includes(role)) {
+      return res.status(403).json({ message: "Only managers can delete sessions" });
+    }
+
+    const { sessionIds } = req.body;
+    const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+    const sessions = await ChatSession.find({ sessionId: { $in: sessionIds }, websiteId: { $in: ownedWebsiteIds } });
+
+    for (const session of sessions) {
+      await logAuditEvent({
+        actor: req.user,
+        action: "chat.bulk_deleted",
+        entityType: "chat_session",
+        entityId: session._id,
+        websiteId: session.websiteId,
+        metadata: { sessionId: session.sessionId },
+        ipAddress: req.ip
+      });
+      await session.deleteOne();
+    }
+
+    res.json({ message: "Bulk deletion completed", count: sessions.length });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
+export async function deleteChatSession(req, res) {
+  try {
+    const role = normalizeRole(req.user.role);
+    if (!["admin", "client", "manager"].includes(role)) {
+      return res.status(403).json({ message: "Only managers can delete sessions" });
+    }
+
+    const { sessionId } = req.params;
+    const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+    const session = await ChatSession.findOne({ sessionId, websiteId: { $in: ownedWebsiteIds } });
+
+    if (!session) return res.status(404).json({ message: "Session not found" });
+
+    await logAuditEvent({
+      actor: req.user,
+      action: "chat.deleted",
+      entityType: "chat_session",
+      entityId: session._id,
+      websiteId: session.websiteId,
+      metadata: { sessionId: session.sessionId },
+      ipAddress: req.ip
+    });
+
+    await session.deleteOne();
+    res.json({ message: "Session deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
 // ─── Feature 7: Business Hours helper ────────────────────────────────────────
 export function isBusinessOpen(businessHours) {
   if (!businessHours?.enabled) return true; // if not configured → always open
@@ -632,5 +806,8 @@ export function isBusinessOpen(businessHours) {
   const openMinutes = openH * 60 + openM;
   const closeMinutes = closeH * 60 + closeM;
 
+  if (closeMinutes < openMinutes) {
+    return currentMinutes >= openMinutes || currentMinutes < closeMinutes;
+  }
   return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
 }

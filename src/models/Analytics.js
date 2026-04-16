@@ -7,7 +7,10 @@ const analyticsSchema = new mongoose.Schema(
     totalCustomers: { type: Number, default: 0 },
     activeChats: { type: Number, default: 0 },
     resolvedChats: { type: Number, default: 0 },
-    avgResponseTimeSeconds: { type: Number, default: 0 }
+    avgResponseTimeSeconds: { type: Number, default: 0 },
+    totalRevenue: { type: Number, default: 0 },
+    avgConversionTimeSeconds: { type: Number, default: 0 },
+    conversions: { type: Number, default: 0 }
   },
   { timestamps: true }
 );

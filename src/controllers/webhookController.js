@@ -1,3 +1,4 @@
+import { logger } from "../utils/logger.js";
 import Stripe from "stripe";
 import { env } from "../config/env.js";
 import { User } from "../models/User.js";
@@ -68,6 +69,62 @@ export const handleWebhook = asyncHandler(async (req, res) => {
       break;
     }
 
+    case "payment_intent.succeeded": {
+      // Payment for a quotation succeeded
+      try {
+        const pi = event.data.object;
+        const metadata = pi.metadata || {};
+        const quotationId = metadata.quotationId || metadata.quotation_id;
+        if (quotationId) {
+          const quotation = await Quotation.findOne({ quotationId });
+          if (quotation && quotation.status !== "accepted") {
+            quotation.status = "accepted";
+            quotation.tracking.push({ event: "accepted", occuredAt: new Date(), ip: req.ip });
+            await quotation.save();
+
+            // Move customer to won
+            const customer = await Customer.findById(quotation.customerId);
+            if (customer && customer.pipelineStage !== "won") {
+              const prev = customer.pipelineStage;
+              customer.pipelineStage = "won";
+              customer.dealStage = "won";
+              customer.status = "customer";
+              customer.recordType = "customer";
+              await customer.save();
+
+              await createActivityEvent({
+                actor: null,
+                websiteId: customer.websiteId,
+                entityType: "customer",
+                entityId: customer._id,
+                type: "stage_changed",
+                summary: "Deal won via payment",
+                metadata: { fromStage: prev, toStage: "won", quotationId: quotation.quotationId }
+              });
+
+              await createAndEmitCrmNotification({
+                recipient: customer.ownerId,
+                type: "crm_deal_won",
+                title: "Deal confirmed",
+                message: `${customer.name} marked won via payment`,
+                link: `/crm/${customer._id}`
+              });
+
+              // Update analytics revenue (best-effort)
+              try {
+                await addWonRevenue(customer.websiteId, quotation.total || 0);
+              } catch (err) {
+                console.error("analytics update after payment failed", err);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Error handling payment_intent.succeeded webhook:", err);
+      }
+      break;
+    }
+
     case "invoice.payment_failed": {
       const subscriptionId = session.subscription;
       if (subscriptionId) {
@@ -80,7 +137,7 @@ export const handleWebhook = asyncHandler(async (req, res) => {
             actor: user,
             action: "billing.payment_failed",
             entityType: "user",
-            entityId: user._id, 
+            entityId: user._id,
             metadata: { stripeSubscriptionId: subscriptionId }
           });
         }
@@ -107,7 +164,7 @@ export const handleWebhook = asyncHandler(async (req, res) => {
     }
 
     default:
-      console.log(`Unhandled event type ${event.type}`);
+      logger.log(`Unhandled event type ${event.type}`);
   }
 
   res.json({ received: true });

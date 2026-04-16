@@ -1,7 +1,8 @@
+import { logger } from "../utils/logger.js";
 import mongoose from "mongoose";
 import { env } from "./env.js";
 
 export async function connectDatabase() {
   await mongoose.connect(env.mongoUri);
-  console.log("MongoDB connected");
+  logger.log("MongoDB connected");
 }

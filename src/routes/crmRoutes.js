@@ -15,7 +15,18 @@ import {
   mergeCustomers,
   autoAssignCustomer,
   getMyFollowUpTasks,
-  getMyCustomerNotes
+  getMyCustomerNotes,
+  createQuotation,
+  getCustomerQuotations,
+  updateQuotationStatus,
+  approveQuotation,
+  denyQuotation,
+  sendQuotation,
+  createQuotationPayment,
+  bulkUpdateCustomers,
+  bulkDeleteCustomers,
+  promoteVisitor
+  , getCrmReports, postWin
 } from "../controllers/crmController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
@@ -44,6 +55,11 @@ router.get("/", listCustomers);
 router.get("/tasks/my", getMyFollowUpTasks);
 router.get("/notes/my", getMyCustomerNotes);
 router.post("/", requireRole("admin", "client", "manager", "sales"), validate(createCustomerSchema), createCustomer);
+router.post("/promote", requireRole("admin", "client", "manager", "agent", "sales"), promoteVisitor);
+
+// Bulk operations (Manager only)
+router.patch("/bulk-update", requireRole("admin", "client", "manager"), bulkUpdateCustomers);
+router.post("/bulk-delete", requireRole("admin", "client", "manager"), bulkDeleteCustomers);
 
 // Single record operations
 router.get("/:id", getCustomerProfile);
@@ -59,6 +75,9 @@ router.post("/:id/archive", requireRole("admin", "client", "manager"), archiveCu
 // Delete (manager + owner; sales cannot delete)
 router.delete("/:id", requireRole("admin", "client", "manager"), deleteCustomer);
 
+// Post-win workflow: convert record to won/customer, create onboarding tasks, draft quotation, notify
+router.post("/:id/post-win", requireRole("admin", "client", "manager", "sales"), postWin);
+
 // Auto-assign (manager + owner only)
 router.post("/:id/auto-assign", requireRole("admin", "client", "manager"), autoAssignCustomer);
 
@@ -72,5 +91,17 @@ router.post("/merge", requireRole("admin", "client", "manager"), validate(mergeC
 router.post("/:id/tasks", requireRole("admin", "client", "manager", "sales"), validate(createFollowUpTaskSchema), createFollowUpTask);
 router.patch("/:id/tasks/:taskId", requireRole("admin", "client", "manager", "sales"), validate(updateFollowUpTaskSchema), updateFollowUpTask);
 router.delete("/:id/tasks/:taskId", requireRole("admin", "client", "manager", "sales"), deleteFollowUpTask);
+
+// Quotations
+router.get("/:customerId/quotations", getCustomerQuotations);
+router.post("/quotations", requireRole("admin", "client", "manager", "sales"), createQuotation);
+router.patch("/quotations/:id/status", updateQuotationStatus);
+router.post("/quotations/:id/send", requireRole("admin", "client", "manager", "sales"), sendQuotation);
+router.post("/quotations/:id/pay", requireRole("admin", "client", "manager", "sales"), createQuotationPayment);
+router.post("/quotations/:id/approve", requireRole("admin", "client", "manager"), approveQuotation);
+router.post("/quotations/:id/deny", requireRole("admin", "client", "manager"), denyQuotation);
+
+// CRM reports
+router.get("/reports", requireRole("admin", "client", "manager"), getCrmReports);
 
 export default router;

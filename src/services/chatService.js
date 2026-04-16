@@ -1,10 +1,11 @@
+import { logger } from "../utils/logger.js";
 import { ChatSession } from "../models/ChatSession.js";
 import { Message } from "../models/Message.js";
 import { Visitor } from "../models/Visitor.js";
 import { findAvailableAgent } from "./assignmentService.js";
 import { generatePublicId } from "../utils/generateKey.js";
 import { incrementActiveChats, incrementResolvedChats, incrementVisitors, updateAverageResponseTime } from "./analyticsService.js";
-import { getOrCreateCustomer } from "./customerService.js";
+import { getOrCreateCustomer, findDefaultCrmOwner } from "./customerService.js";
 import geoip from "geoip-lite";
 import { UAParser } from "ua-parser-js";
 
@@ -17,7 +18,7 @@ export async function registerVisitor({ website, visitorToken, ipAddress, device
   };
 
   const cleanToken = cleanField(visitorToken);
-  const cleanName  = cleanField(name);
+  const cleanName = cleanField(name);
   const cleanEmail = cleanField(email);
 
   const visitorId = cleanToken || generatePublicId("visitor");
@@ -87,11 +88,14 @@ export async function registerVisitor({ website, visitorToken, ipAddress, device
   });
 
   // CRN Integration: Create/update Customer record for ALL visitors (identified or anonymous)
-  const customer = await getOrCreateCustomer({ 
-    name: cleanName, 
-    email: cleanEmail, 
+  const defaultOwnerId = await findDefaultCrmOwner({ websiteId: website._id, managerId: website.managerId });
+  const customer = await getOrCreateCustomer({
+    name: cleanName,
+    email: cleanEmail,
     websiteId: website._id,
-    visitorId: visitorId  // used as fallback unique key for anonymous visitors
+    visitorId: visitorId,
+    leadSource: "Live Chat",
+    ownerId: defaultOwnerId
   });
   if (customer) {
     visitor.customerId = customer._id;
@@ -107,10 +111,10 @@ export async function findOrCreateSession({ website, visitor, currentPage = "", 
   let session = null;
 
   if (sessionId) {
-    session = await ChatSession.findOne({ 
-      sessionId, 
+    session = await ChatSession.findOne({
+      sessionId,
       websiteId: website._id,
-      visitorId: visitor._id 
+      visitorId: visitor._id
     }).populate("assignedAgent", "name email isOnline");
   }
 
@@ -159,14 +163,14 @@ export async function findOrCreateSession({ website, visitor, currentPage = "", 
 export async function addMessage({ chatSession, sender, message, attachmentUrl = null, attachmentType = null, agentId = null }) {
   try {
     if (!chatSession?._id) {
-       console.error("[SERVICE_ERROR]: addMessage called without valid chatSession._id");
-       throw new Error("Invalid session ID for message");
+      console.error("[SERVICE_ERROR]: addMessage called without valid chatSession._id");
+      throw new Error("Invalid session ID for message");
     }
 
     // Gracefully handle empty message if attachment exists to satisfy Mongoose validation
     const msgText = (message && message.trim()) ? message : (attachmentUrl ? "Sent an attachment" : "");
-    
-    console.log(`[SERVICE_TRACE]: Attempting to create message for session ${chatSession._id} from ${sender}`);
+
+    logger.log(`[SERVICE_TRACE]: Attempting to create message for session ${chatSession._id} from ${sender}`);
     const savedMessage = await Message.create({
       sessionId: chatSession._id,
       sender,
@@ -176,7 +180,7 @@ export async function addMessage({ chatSession, sender, message, attachmentUrl =
       agentId: agentId || null
     });
 
-    console.log(`[SERVICE_TRACE]: Message created successfully: ${savedMessage._id}`);
+    logger.log(`[SERVICE_TRACE]: Message created successfully: ${savedMessage._id}`);
 
     // Update session with latest metadata for faster dashboard rendering
     const update = {

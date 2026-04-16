@@ -9,6 +9,7 @@ const webhookDeliverySchema = new mongoose.Schema(
     responseStatus: { type: Number, default: null },
     responseBody: { type: String, default: "" },
     success: { type: Boolean, default: false, index: true },
+    attempts: { type: Number, default: 1 },
     attemptedAt: { type: Date, default: Date.now }
   },
   { timestamps: true }

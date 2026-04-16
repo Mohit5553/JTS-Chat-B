@@ -19,6 +19,7 @@ import { Customer } from "../models/Customer.js";
 import { getSocketServer } from "../sockets/index.js";
 import { PERMISSIONS, requirePermission } from "../utils/permissions.js";
 import { buildTicketSlaFields, inferTicketPriority } from "../services/automationService.js";
+import { calculateTicketHeatScore, getTicketNBA } from "../services/intelligenceService.js";
 
 function normalizeDepartment(value) {
   return String(value || "").trim().toLowerCase() || "general";
@@ -309,14 +310,26 @@ async function ensureSessionTicketAccess(session, user) {
 export const getTickets = async (req, res) => {
   try {
     requirePermission(req.user, PERMISSIONS.TICKET_VIEW);
-    const { websiteId, status, priority, crmStage, crn } = req.query;
+    const { websiteId, status, priority, crmStage, crn, range = "all" } = req.query;
     const filter = await buildTicketScopeFilter(req.user);
 
     if (websiteId) filter.websiteId = websiteId;
-    if (status) filter.status = status;
-    if (priority) filter.priority = priority;
-    if (crmStage) filter.crmStage = crmStage;
+    if (status && status !== "all") filter.status = status;
+    if (priority && priority !== "all") filter.priority = priority;
+    if (crmStage && crmStage !== "all") filter.crmStage = crmStage;
     if (crn) filter.crn = crn;
+
+    // Range filtering
+    const now = new Date();
+    if (range === "today") {
+      filter.createdAt = { $gte: new Date(now.setHours(0,0,0,0)) };
+    } else if (range === "week") {
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      filter.createdAt = { $gte: weekAgo };
+    } else if (range === "month") {
+      filter.createdAt = { $gte: new Date(now.getFullYear(), now.getMonth(), 1) };
+    }
 
     if (websiteId && ["client", "manager"].includes(normalizeRole(req.user.role))) {
       const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
@@ -335,7 +348,30 @@ export const getTickets = async (req, res) => {
       .populate("websiteId", "websiteName domain")
       .sort({ createdAt: -1 });
 
-    res.json(tickets);
+    // Status counts for the selected range
+    const summaryMatch = { websiteId: websiteId || { $exists: true } };
+    if (filter.createdAt) summaryMatch.createdAt = filter.createdAt;
+
+    const summaryAgg = await Ticket.aggregate([
+      { $match: summaryMatch },
+      { $group: { _id: "$status", count: { $sum: 1 } } }
+    ]);
+
+    const summary = summaryAgg.reduce((acc, curr) => {
+      acc[curr._id] = curr.count;
+      return acc;
+    }, { all: await Ticket.countDocuments(summaryMatch) });
+
+    // Map Intelligence
+    const enrichedTickets = await Promise.all(tickets.map(async (t) => {
+      const doc = t.toObject();
+      doc.heatScore = calculateTicketHeatScore(doc);
+      const nba = await getTicketNBA(doc);
+      doc.nbaMetadata = nba;
+      return doc;
+    }));
+
+    res.json({ tickets: enrichedTickets, summary });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -705,7 +741,84 @@ export const updateTicket = async (req, res) => {
       .populate("assignmentHistory.assignedBy", "name email role")
       .populate("websiteId", "websiteName domain");
 
+    await logAuditEvent({
+      actor: req.user,
+      action: "ticket.updated",
+      entityType: "ticket",
+      entityId: updated._id,
+      websiteId: updated.websiteId?._id || updated.websiteId,
+      metadata: { 
+        ticketId: updated.ticketId, 
+        status: updated.status, 
+        priority: updated.priority,
+        assignedAgentId: updated.assignedAgent?._id
+      },
+      ipAddress: req.ip
+    });
+
     res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const deleteTicket = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const role = normalizeRole(req.user.role);
+    if (!["admin", "client", "manager"].includes(role)) {
+      return res.status(403).json({ message: "Only managers can delete tickets" });
+    }
+
+    const ticket = await findScopedTicketById(id, req.user);
+    if (!ticket) return res.status(404).json({ message: "Ticket not found" });
+
+    await logAuditEvent({
+      actor: req.user,
+      action: "ticket.deleted",
+      entityType: "ticket",
+      entityId: ticket._id,
+      websiteId: ticket.websiteId,
+      metadata: { ticketId: ticket.ticketId, subject: ticket.subject },
+      ipAddress: req.ip
+    });
+
+    await ticket.deleteOne();
+    res.json({ message: "Ticket deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const bulkDeleteTickets = async (req, res) => {
+  try {
+    const role = normalizeRole(req.user.role);
+    if (!["admin", "client", "manager"].includes(role)) {
+      return res.status(403).json({ message: "Only managers can bulk delete tickets" });
+    }
+
+    const { ticketIds } = req.body;
+    if (!ticketIds || !Array.isArray(ticketIds) || ticketIds.length === 0) {
+      return res.status(400).json({ message: "ticketIds array is required" });
+    }
+
+    const scope = await buildTicketScopeFilter(req.user);
+    const tickets = await Ticket.find({ _id: { $in: ticketIds }, ...scope });
+
+    for (const ticket of tickets) {
+      await logAuditEvent({
+        actor: req.user,
+        action: "ticket.bulk_deleted",
+        entityType: "ticket",
+        entityId: ticket._id,
+        websiteId: ticket.websiteId,
+        metadata: { ticketId: ticket.ticketId },
+        ipAddress: req.ip
+      });
+      await ticket.deleteOne();
+    }
+
+    res.json({ message: "Bulk deletion completed", count: tickets.length });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -845,6 +958,16 @@ export const submitVisitorTicket = async (req, res) => {
       status: newTicket.status,
       subject: newTicket.subject,
       channel: newTicket.channel
+    });
+
+    await logAuditEvent({
+      actor: null, // Public submission
+      action: "ticket.public_submitted",
+      entityType: "ticket",
+      entityId: newTicket._id,
+      websiteId: newTicket.websiteId,
+      metadata: { ticketId: newTicket.ticketId, channel: "web", email },
+      ipAddress: req.ip
     });
 
     res.status(201).json({
