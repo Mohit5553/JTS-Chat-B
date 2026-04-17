@@ -101,7 +101,8 @@ export const updateCustomerSchema = z.object({
   leadCategory: z.enum(["cold", "warm", "hot"]).optional(),
   probability: z.number().min(0).max(100).optional(),
   priority: z.enum(["low", "medium", "high"]).optional(),
-  lostReason: z.enum(CRM_LOST_REASONS).optional().or(z.literal("")).or(z.literal("other")),
+  // Accept either the canonical enum or freeform text from the UI (e.g. "Lost to Competitor")
+  lostReason: z.union([z.enum(CRM_LOST_REASONS), z.string().max(120)]).optional().or(z.literal("")),
   expectedCloseDate: z.union([z.string().max(40), z.null()]).optional(),
   decisionMaker: z.string().max(120).optional(),
   ownerId: z.string().nullable().optional(),

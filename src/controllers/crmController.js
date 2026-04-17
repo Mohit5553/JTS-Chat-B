@@ -5,6 +5,7 @@ import { User } from "../models/User.js";
 import { FollowUpTask } from "../models/FollowUpTask.js";
 import { Visitor } from "../models/Visitor.js";
 import { Quotation } from "../models/Quotation.js";
+import { Invoice } from "../models/Invoice.js";
 import { generateQuotationPDF } from "../services/pdfService.js";
 import { Analytics } from "../models/Analytics.js";
 import { getOwnedWebsiteIds } from "../utils/roleUtils.js";
@@ -363,6 +364,14 @@ export const listCustomers = asyncHandler(async (req, res) => {
     range = "month"
   } = req.query;
 
+  // Manager scope: include direct reports (agents/sales/etc) plus the manager themselves for summary metrics.
+  // (Sales scope restriction is handled below.)
+  let summaryOwnerIds = null;
+  if (req.user.role === "manager") {
+    const team = await User.find({ managerId: req.user._id }).select("_id");
+    summaryOwnerIds = [req.user._id, ...team.map(t => t._id)];
+  }
+
   // Safety guard: no owned websites means no data access
   if (ownedWebsiteIds.length === 0) {
     return res.json({
@@ -567,10 +576,14 @@ export const listCustomers = asyncHandler(async (req, res) => {
   ]);
 
   const [myLeads, dueToday, noFollowUp, wonThisMonth, archived, lostReasons, stageBreakdown, agents, analytics, leadsBySource, followUpHealth, agentTasks, lostByStageRaw, leadsPerDay, prevMonthStats, lostByStage, dropOffByCategory] = await Promise.all([
-    Customer.countDocuments({ websiteId: query.websiteId, ownerId: req.user._id, archivedAt: null }),
+    Customer.countDocuments({
+      websiteId: query.websiteId,
+      ...(summaryOwnerIds ? { ownerId: { $in: summaryOwnerIds } } : { ownerId: req.user._id }),
+      archivedAt: null
+    }),
     FollowUpTask.countDocuments({
       websiteId: query.websiteId,
-      ownerId: req.user._id,
+      ...(summaryOwnerIds ? { ownerId: { $in: summaryOwnerIds } } : { ownerId: req.user._id }),
       status: { $in: ["open", "in_progress"] },
       dueAt: {
         $gte: new Date(new Date().setHours(0, 0, 0, 0)),
@@ -596,7 +609,13 @@ export const listCustomers = asyncHandler(async (req, res) => {
       { $sort: { count: -1 } }
     ]),
     Customer.aggregate([
-      { $match: { websiteId: query.websiteId, pipelineStage: "won", ownerId: { $ne: null } } },
+      {
+        $match: {
+          websiteId: query.websiteId,
+          pipelineStage: "won",
+          ownerId: summaryOwnerIds ? { $in: summaryOwnerIds } : { $ne: null }
+        }
+      },
       {
         $group: {
           _id: "$ownerId",
@@ -628,7 +647,13 @@ export const listCustomers = asyncHandler(async (req, res) => {
       }
     ]),
     FollowUpTask.aggregate([
-      { $match: { websiteId: query.websiteId, status: "completed" } },
+      {
+        $match: {
+          websiteId: query.websiteId,
+          status: "completed",
+          ...(summaryOwnerIds ? { ownerId: { $in: summaryOwnerIds } } : {})
+        }
+      },
       { $group: { _id: "$ownerId", count: { $sum: 1 } } }
     ]),
     Customer.aggregate([
@@ -1204,6 +1229,79 @@ export const getCrmReports = asyncHandler(async (req, res) => {
 
   const row = agg[0] || { totalRevenue: 0, deals: 0, avgConversionSeconds: 0 };
   res.json({ totalRevenue: row.totalRevenue || 0, deals: row.deals || 0, avgConversionSeconds: Math.round(row.avgConversionSeconds || 0) });
+});
+
+/**
+ * Time-series of won revenue (by day)
+ * query: websiteId, days (default 30)
+ */
+export const getWonRevenueTimeseries = asyncHandler(async (req, res) => {
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const { websiteId, days = 30 } = req.query;
+  const dayCount = Math.max(1, Math.min(365, parseInt(days, 10) || 30));
+
+  if (websiteId) {
+    if (!ownedWebsiteIds.map(String).includes(String(websiteId))) throw new AppError("Access denied", 403);
+  }
+
+  // Build date range
+  const end = new Date();
+  end.setHours(23, 59, 59, 999);
+  const start = new Date(end);
+  start.setDate(end.getDate() - (dayCount - 1));
+  start.setHours(0, 0, 0, 0);
+
+  const match = {
+    websiteId: websiteId ? websiteId : { $in: ownedWebsiteIds },
+    status: "paid",
+    issuedAt: { $gte: start, $lte: end }
+  };
+
+  const agg = await Invoice.aggregate([
+    { $match: match },
+    {
+      $project: {
+        issuedAt: 1,
+        total: 1
+      }
+    },
+    {
+      $group: {
+        _id: { $dateToString: { format: "%Y-%m-%d", date: "$issuedAt" } },
+        revenue: { $sum: "$total" }
+      }
+    },
+    { $sort: { _id: 1 } }
+  ]);
+
+  // Build map
+  const map = {};
+  agg.forEach((r) => { map[r._id] = r.revenue || 0; });
+
+  const series = [];
+  for (let i = 0; i < dayCount; i++) {
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
+    const key = d.toISOString().split("T")[0];
+    series.push({ date: key, revenue: map[key] || 0 });
+  }
+
+  const totalRevenue = series.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+  res.json({ series, totalRevenue });
+});
+
+/**
+ * List invoices for a given customer (CRM access required)
+ */
+export const getCustomerInvoices = asyncHandler(async (req, res) => {
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const { customerId } = req.params;
+  const customer = await Customer.findById(customerId).select("websiteId");
+  if (!customer) throw new AppError("Customer not found", 404);
+  if (!ownedWebsiteIds.map(String).includes(String(customer.websiteId))) throw new AppError("Access denied", 403);
+
+  const invoices = await Invoice.find({ customerId }).sort({ issuedAt: -1 }).limit(100);
+  res.json(invoices);
 });
 
 /**

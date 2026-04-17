@@ -23,10 +23,11 @@ import {
   denyQuotation,
   sendQuotation,
   createQuotationPayment,
+  getCustomerInvoices,
   bulkUpdateCustomers,
   bulkDeleteCustomers,
   promoteVisitor
-  , getCrmReports, postWin
+  , getCrmReports, getWonRevenueTimeseries, postWin
 } from "../controllers/crmController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
@@ -61,6 +62,10 @@ router.post("/promote", requireRole("admin", "client", "manager", "agent", "sale
 router.patch("/bulk-update", requireRole("admin", "client", "manager"), bulkUpdateCustomers);
 router.post("/bulk-delete", requireRole("admin", "client", "manager"), bulkDeleteCustomers);
 
+// CRM reports (must be defined before "/:id" route)
+router.get("/reports", requireRole("admin", "client", "manager"), getCrmReports);
+router.get("/reports/won-timeseries", requireRole("admin", "client", "manager"), getWonRevenueTimeseries);
+
 // Single record operations
 router.get("/:id", getCustomerProfile);
 router.get("/:id/activity", getCustomerActivity);
@@ -94,14 +99,12 @@ router.delete("/:id/tasks/:taskId", requireRole("admin", "client", "manager", "s
 
 // Quotations
 router.get("/:customerId/quotations", getCustomerQuotations);
+router.get("/:customerId/invoices", requireRole("admin", "client", "manager", "sales"), getCustomerInvoices);
 router.post("/quotations", requireRole("admin", "client", "manager", "sales"), createQuotation);
 router.patch("/quotations/:id/status", updateQuotationStatus);
 router.post("/quotations/:id/send", requireRole("admin", "client", "manager", "sales"), sendQuotation);
 router.post("/quotations/:id/pay", requireRole("admin", "client", "manager", "sales"), createQuotationPayment);
 router.post("/quotations/:id/approve", requireRole("admin", "client", "manager"), approveQuotation);
 router.post("/quotations/:id/deny", requireRole("admin", "client", "manager"), denyQuotation);
-
-// CRM reports
-router.get("/reports", requireRole("admin", "client", "manager"), getCrmReports);
 
 export default router;
