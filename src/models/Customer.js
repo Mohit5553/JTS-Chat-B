@@ -137,7 +137,9 @@ const customerSchema = new mongoose.Schema(
     archivedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     archiveReason: { type: String, trim: true, default: "" },
     restoredAt: { type: Date, default: null },
-    restoredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }
+    restoredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    isLocked: { type: Boolean, default: false },
+    generatedCode: { type: String, trim: true, default: "" }
   },
   { timestamps: true }
 );

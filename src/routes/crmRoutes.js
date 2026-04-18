@@ -26,8 +26,11 @@ import {
   getCustomerInvoices,
   bulkUpdateCustomers,
   bulkDeleteCustomers,
-  promoteVisitor
-  , getCrmReports, getWonRevenueTimeseries, postWin
+  promoteVisitor,
+  getCrmReports,
+  getWonRevenueTimeseries,
+  postWin,
+  generateLeadCode
 } from "../controllers/crmController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
@@ -82,6 +85,7 @@ router.delete("/:id", requireRole("admin", "client", "manager"), deleteCustomer)
 
 // Post-win workflow: convert record to won/customer, create onboarding tasks, draft quotation, notify
 router.post("/:id/post-win", requireRole("admin", "client", "manager", "sales"), postWin);
+router.post("/:id/generate-code", requireRole("admin", "client", "manager", "sales"), generateLeadCode);
 
 // Auto-assign (manager + owner only)
 router.post("/:id/auto-assign", requireRole("admin", "client", "manager"), autoAssignCustomer);

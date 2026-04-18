@@ -1079,6 +1079,10 @@ export const postWin = asyncHandler(async (req, res) => {
     throw new AppError("Unauthorized access to this website's CRM data", 403);
   }
 
+  if (customer.isLocked) {
+    throw new AppError("This lead is locked and cannot be modified.", 403);
+  }
+
   // Idempotent: if already won, return current state
   if (String(customer.pipelineStage) === "won" || String(customer.status) === "won") {
     return res.json(await buildCustomerPayload(customer._id));
@@ -1438,6 +1442,10 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
   if (!ownedWebsiteIds.map(id => id.toString()).includes(customer.websiteId.toString())) {
     throw new AppError("Unauthorized access", 403);
+  }
+
+  if (customer.isLocked) {
+    throw new AppError("This lead is locked and cannot be modified.", 403);
   }
 
   // Sales: enforce status transition limits
@@ -2561,3 +2569,56 @@ export const promoteVisitor = asyncHandler(async (req, res) => {
 
   res.json(customer);
 });
+
+/**
+ * Generate a code for a 'Won' lead and lock it from further stage changes.
+ */
+export const generateLeadCode = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
+  const id = req.params.id;
+  const customer = await Customer.findById(id);
+  if (!customer) throw new AppError("Lead not found", 404);
+
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  if (!ownedWebsiteIds.map(String).includes(String(customer.websiteId))) {
+    throw new AppError("Unauthorized access to this lead", 403);
+  }
+
+  if (customer.pipelineStage !== "won") {
+    throw new AppError("Codes can only be generated for leads in 'Won' stage", 400);
+  }
+
+  if (customer.isLocked) {
+    return res.json(customer); // Idempotent
+  }
+
+  // Generate a premium-looking code
+  const randomSuffix = Math.random().toString(36).substring(2, 8).toUpperCase();
+  const code = `WON-${customer.crn}-${randomSuffix}`;
+
+  customer.isLocked = true;
+  customer.generatedCode = code;
+  await customer.save();
+
+  await emitCustomerActivity({
+    actor: req.user,
+    websiteId: customer.websiteId,
+    customerId: customer._id,
+    type: "status_changed",
+    summary: `Lead locked and code ${code} generated`,
+    metadata: { code }
+  });
+
+  await logAuditEvent({
+    actor: req.user,
+    action: "crm.lead_locked",
+    entityType: "customer",
+    entityId: customer._id,
+    websiteId: customer.websiteId,
+    metadata: { code },
+    ipAddress: req.ip
+  });
+
+  res.json(customer);
+});
+
