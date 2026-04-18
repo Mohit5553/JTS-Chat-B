@@ -30,7 +30,8 @@ import {
   getCrmReports,
   getWonRevenueTimeseries,
   postWin,
-  generateLeadCode
+  generateLeadCode,
+  searchCustomers
 } from "../controllers/crmController.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { attachTenantSubscription, requirePlanFeature } from "../middleware/planAccess.js";
@@ -56,6 +57,7 @@ router.use(requirePlanFeature("crm"));
 
 // List & create
 router.get("/", listCustomers);
+router.get("/search", searchCustomers);
 router.get("/tasks/my", getMyFollowUpTasks);
 router.get("/notes/my", getMyCustomerNotes);
 router.post("/", requireRole("admin", "client", "manager", "sales"), validate(createCustomerSchema), createCustomer);
@@ -63,7 +65,7 @@ router.post("/promote", requireRole("admin", "client", "manager", "agent", "sale
 
 // Bulk operations (Manager only)
 router.patch("/bulk-update", requireRole("admin", "client", "manager"), bulkUpdateCustomers);
-router.post("/bulk-delete", requireRole("admin", "client", "manager"), bulkDeleteCustomers);
+router.delete("/bulk-delete", requireRole("admin", "client", "manager"), bulkDeleteCustomers);
 
 // CRM reports (must be defined before "/:id" route)
 router.get("/reports", requireRole("admin", "client", "manager"), getCrmReports);

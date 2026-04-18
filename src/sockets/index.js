@@ -229,6 +229,51 @@ export function createSocketServer(httpServer) {
       socket.join(sessionId);
     });
 
+    socket.on("crm:viewing-lead", ({ leadId, isViewing }) => {
+      if (!leadId || !socket.data.user) return;
+      
+      const room = `lead_${leadId}`;
+      if (isViewing) {
+        socket.join(room);
+        socket.to(room).emit("crm:lead-presence", {
+          leadId,
+          user: {
+            _id: socket.data.user._id,
+            name: socket.data.user.name,
+            role: socket.data.user.role
+          },
+          isViewing: true
+        });
+        
+        // Also tell the current user about others in the room
+        const clients = io.sockets.adapter.rooms.get(room);
+        if (clients) {
+          const others = [];
+          for (const clientId of clients) {
+            if (clientId === socket.id) continue;
+            const s = io.sockets.sockets.get(clientId);
+            if (s?.data?.user) {
+              others.push({
+                _id: s.data.user._id,
+                name: s.data.user.name,
+                role: s.data.user.role
+              });
+            }
+          }
+          if (others.length > 0) {
+            socket.emit("crm:lead-presence-sync", { leadId, others });
+          }
+        }
+      } else {
+        socket.leave(room);
+        socket.to(room).emit("crm:lead-presence", {
+          leadId,
+          user: { _id: socket.data.user._id, name: socket.data.user.name },
+          isViewing: false
+        });
+      }
+    });
+
     socket.on("visitor:typing", ({ sessionId, isTyping }) => {
       socket.to(sessionId).emit("chat:typing", { isTyping, sender: "visitor" });
     });

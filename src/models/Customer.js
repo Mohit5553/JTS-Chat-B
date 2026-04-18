@@ -139,7 +139,11 @@ const customerSchema = new mongoose.Schema(
     restoredAt: { type: Date, default: null },
     restoredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     isLocked: { type: Boolean, default: false },
-    generatedCode: { type: String, trim: true, default: "" }
+    generatedCode: { type: String, trim: true, default: "" },
+    scoreHistory: [{
+      score: { type: Number, required: true },
+      recordedAt: { type: Date, default: Date.now }
+    }]
   },
   { timestamps: true }
 );

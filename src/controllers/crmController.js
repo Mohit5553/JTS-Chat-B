@@ -994,7 +994,8 @@ export const createCustomer = asyncHandler(async (req, res) => {
       ownerId: resolvedOwnerId || null,
       sessionId: sessionId || null
     },
-    ipAddress: req.ip
+    ipAddress: req.ip,
+    after: customer
   });
 
   if (sessionId) {
@@ -1056,7 +1057,9 @@ export const archiveCustomer = asyncHandler(async (req, res) => {
     entityId: customer._id,
     websiteId: customer.websiteId,
     metadata: { crn: customer.crn },
-    ipAddress: req.ip
+    ipAddress: req.ip,
+    before: snapshotBefore,
+    after: customer
   });
 
   const updated = await Customer.findById(customer._id)
@@ -1438,6 +1441,7 @@ export const updateCustomer = asyncHandler(async (req, res) => {
     expectedCloseDate: customer.expectedCloseDate,
     decisionMaker: customer.decisionMaker
   };
+  const snapshotBefore = customer.toObject();
 
   const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
   if (!ownedWebsiteIds.map(id => id.toString()).includes(customer.websiteId.toString())) {
@@ -1592,6 +1596,45 @@ export const updateCustomer = asyncHandler(async (req, res) => {
 
   customer.lastActivity = new Date();
   customer.lastInteraction = new Date();
+
+  // Track score history and detect spikes
+  const currentScore = customer.score || 0;
+  if (!customer.scoreHistory) customer.scoreHistory = [];
+  
+  // Find a score from approx 24 hours ago
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const oldScoreEntry = [...customer.scoreHistory]
+    .reverse()
+    .find(h => h.recordedAt <= oneDayAgo);
+  
+  if (oldScoreEntry && (currentScore - oldScoreEntry.score) >= 20) {
+    // Spike detected!
+    const io = getSocketServer();
+    if (io && customer.ownerId) {
+      io.to(`us_${customer.ownerId}`).emit("crm:intent-alert", {
+        leadId: customer._id,
+        name: customer.name,
+        spike: currentScore - oldScoreEntry.score,
+        currentScore
+      });
+      
+      await createNotification({
+        recipient: customer.ownerId,
+        type: "crm_follow_up_due", // Reusing type for UI icon
+        title: "🔥 High Intent Spike detected",
+        message: `${customer.name}'s heat score jumped by ${currentScore - oldScoreEntry.score} points! Intervene now to close the deal.`,
+        link: "/sales"
+      });
+    }
+  }
+
+  // Only record history if score changed or it's been more than 4 hours
+  const lastEntry = customer.scoreHistory[0];
+  if (!lastEntry || lastEntry.score !== currentScore || (Date.now() - new Date(lastEntry.recordedAt)) > 4 * 60 * 60 * 1000) {
+    customer.scoreHistory.unshift({ score: currentScore, recordedAt: new Date() });
+    // Keep history manageable
+    if (customer.scoreHistory.length > 30) customer.scoreHistory.pop();
+  }
 
   await customer.save();
   await emitCustomerActivity({
@@ -2433,99 +2476,6 @@ export const denyQuotation = asyncHandler(async (req, res) => {
   res.json(quotation);
 });
 
-/**
- * Bulk updates multiple customer records (e.g., owner, status, stage).
- */
-export const bulkUpdateCustomers = asyncHandler(async (req, res) => {
-  requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
-  const { ids, updates } = req.body;
-  if (!Array.isArray(ids) || ids.length === 0) throw new AppError("No customer IDs provided.", 400);
-
-  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
-  const stringOwnedIds = ownedWebsiteIds.map(id => id.toString());
-
-  const results = { updated: 0, failed: 0 };
-  const sanitizedUpdates = { ...updates };
-
-  // Guard core fields
-  delete sanitizedUpdates.email;
-  delete sanitizedUpdates.crn;
-  delete sanitizedUpdates._id;
-  delete sanitizedUpdates.websiteId;
-
-  for (const id of ids) {
-    try {
-      const customer = await Customer.findById(id);
-      if (!customer || !stringOwnedIds.includes(customer.websiteId.toString())) {
-        results.failed++;
-        continue;
-      }
-
-      Object.assign(customer, sanitizedUpdates);
-      await customer.save();
-
-      await logAuditEvent({
-        actor: req.user,
-        action: "crm.bulk_update",
-        entityType: "customer",
-        entityId: customer._id,
-        websiteId: customer.websiteId,
-        metadata: { updates: sanitizedUpdates },
-        ipAddress: req.ip
-      });
-
-      results.updated++;
-    } catch (err) {
-      console.error(`Bulk update failed for ${id}:`, err);
-      results.failed++;
-    }
-  }
-
-  res.json({ message: "Bulk update complete", results });
-});
-
-/**
- * Bulk deletes multiple customer records permanently.
- */
-export const bulkDeleteCustomers = asyncHandler(async (req, res) => {
-  requirePermission(req.user, PERMISSIONS.CRM_DELETE);
-  const { ids } = req.body;
-  if (!Array.isArray(ids) || ids.length === 0) throw new AppError("No customer IDs provided.", 400);
-
-  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
-  const stringOwnedIds = ownedWebsiteIds.map(id => id.toString());
-
-  const results = { deleted: 0, failed: 0 };
-
-  for (const id of ids) {
-    try {
-      const customer = await Customer.findById(id);
-      if (!customer || !stringOwnedIds.includes(customer.websiteId.toString())) {
-        results.failed++;
-        continue;
-      }
-
-      await Customer.deleteOne({ _id: id });
-
-      await logAuditEvent({
-        actor: req.user,
-        action: "crm.bulk_delete",
-        entityType: "customer",
-        entityId: id,
-        websiteId: customer.websiteId,
-        metadata: { name: customer.name, crn: customer.crn },
-        ipAddress: req.ip
-      });
-
-      results.deleted++;
-    } catch (err) {
-      console.error(`Bulk delete failed for ${id}:`, err);
-      results.failed++;
-    }
-  }
-
-  res.json({ message: "Bulk delete complete", results });
-});
 
 export const promoteVisitor = asyncHandler(async (req, res) => {
   const { visitorId, sessionId, leadSource = "Live Chat" } = req.body;
@@ -2622,3 +2572,140 @@ export const generateLeadCode = asyncHandler(async (req, res) => {
   res.json(customer);
 });
 
+/**
+ * Global search for CRM leads (lightweight)
+ */
+export const searchCustomers = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_VIEW);
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  const { q } = req.query;
+
+  if (!q || q.length < 2) {
+    return res.json([]);
+  }
+
+  const query = {
+    websiteId: { $in: ownedWebsiteIds },
+    archivedAt: null,
+    $or: [
+      { name: new RegExp(q, "i") },
+      { email: new RegExp(q, "i") },
+      { crn: new RegExp(q, "i") },
+      { phone: new RegExp(q, "i") }
+    ]
+  };
+
+  // Sales role restriction
+  if (req.user.role === "sales") {
+    query.ownerId = req.user._id;
+  }
+
+  const results = await Customer.find(query)
+    .populate("websiteId", "websiteName")
+    .select("name email phone crn pipelineStage websiteId")
+    .limit(15)
+    .sort({ lastInteraction: -1 });
+
+  res.json(results);
+});
+
+/**
+ * Bulk update customers
+ */
+export const bulkUpdateCustomers = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_UPDATE);
+  const { ids, updates } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new AppError("No customer IDs provided", 400);
+  }
+
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  
+  // Security check: ensure all requested IDs belong to the user's websites
+  const customers = await Customer.find({ 
+    _id: { $in: ids }, 
+    websiteId: { $in: ownedWebsiteIds } 
+  });
+
+  if (customers.length === 0) {
+    throw new AppError("No accessible leads found for the provided IDs", 404);
+  }
+
+  // Filter out locked leads
+  const targetIds = customers
+    .filter(c => !c.isLocked)
+    .map(c => c._id);
+
+  if (targetIds.length === 0) {
+    throw new AppError("Selected leads are locked and cannot be updated", 403);
+  }
+
+  // Sanitize updates
+  const allowedUpdates = {};
+  const schema = ["status", "pipelineStage", "recordType", "leadStatus", "dealStage", "priority", "leadCategory", "interestLevel", "ownerId"];
+  schema.forEach(key => {
+    if (updates[key] !== undefined) allowedUpdates[key] = updates[key];
+  });
+
+  const updateResult = await Customer.updateMany(
+    { _id: { $in: targetIds } },
+    { $set: { ...allowedUpdates, lastInteraction: new Date() } }
+  );
+
+  await logAuditEvent({
+    actor: req.user,
+    action: "crm.bulk_update",
+    entityType: "customer",
+    entityId: "bulk",
+    websiteId: customers[0]?.websiteId || null,
+    metadata: { count: targetIds.length, updates: allowedUpdates, targetIds },
+    ipAddress: req.ip
+  });
+
+  res.json({ success: true, count: updateResult.modifiedCount });
+});
+
+/**
+ * Bulk delete customers
+ */
+export const bulkDeleteCustomers = asyncHandler(async (req, res) => {
+  requirePermission(req.user, PERMISSIONS.CRM_DELETE);
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new AppError("No customer IDs provided", 400);
+  }
+
+  const ownedWebsiteIds = await getOwnedWebsiteIds(req.user);
+  
+  // Security check
+  const customers = await Customer.find({ 
+    _id: { $in: ids }, 
+    websiteId: { $in: ownedWebsiteIds } 
+  });
+
+  if (customers.length === 0) {
+    throw new AppError("No accessible leads found for the provided IDs", 404);
+  }
+
+  const targetIds = customers
+    .filter(c => !c.isLocked)
+    .map(c => c._id);
+
+  if (targetIds.length === 0) {
+    throw new AppError("Selected leads are locked and cannot be deleted", 403);
+  }
+
+  const deleteResult = await Customer.deleteMany({ _id: { $in: targetIds } });
+
+  await logAuditEvent({
+    actor: req.user,
+    action: "crm.bulk_delete",
+    entityType: "customer",
+    entityId: "bulk",
+    websiteId: customers[0]?.websiteId || null,
+    metadata: { count: targetIds.length, targetIds },
+    ipAddress: req.ip
+  });
+
+  res.json({ success: true, count: deleteResult.deletedCount });
+});

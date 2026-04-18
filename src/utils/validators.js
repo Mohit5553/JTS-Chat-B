@@ -110,7 +110,17 @@ export const updateCustomerSchema = z.object({
   nextFollowUpAt: z.union([z.string().max(40), z.null()]).optional(),
   lastFollowUpAt: z.union([z.string().max(40), z.null()]).optional(),
   archiveReason: z.string().max(200).optional(),
-}).refine(data => Object.keys(data).length > 0, { message: "At least one field is required" });
+}).refine(data => Object.keys(data).length > 0, { message: "At least one field is required" })
+.superRefine((data, ctx) => {
+  const isLost = data.pipelineStage === "lost" || data.status === "lost" || data.dealStage === "lost";
+  if (isLost && !data.lostReason) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Lost reason is mandatory when deal is lost",
+      path: ["lostReason"],
+    });
+  }
+});
 
 export const createCustomerSchema = z.object({
   name: z.string().trim().min(1).max(120),
